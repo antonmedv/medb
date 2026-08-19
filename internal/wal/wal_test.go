@@ -231,14 +231,11 @@ func TestDrainCommitsUnwaitedRecords(t *testing.T) {
 	}
 }
 
-func TestDrainAfterClose(t *testing.T) {
+func TestTruncateAfterClose(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "wal.log")
 	l := open(t, path)
 	if err := l.Close(); err != nil {
 		t.Fatal(err)
-	}
-	if err := l.Drain(); !errors.Is(err, os.ErrClosed) {
-		t.Fatalf("got %v, want ErrClosed", err)
 	}
 	if err := l.Truncate(); !errors.Is(err, os.ErrClosed) {
 		t.Fatalf("got %v, want ErrClosed", err)

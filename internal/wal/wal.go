@@ -35,7 +35,6 @@ type Log struct {
 	commit  *Commit
 
 	notify chan struct{}
-	drain  chan chan error
 	trunc  chan chan error
 	stop   chan struct{}
 	done   sync.WaitGroup
@@ -72,7 +71,6 @@ func newLog(f file, size int64) *Log {
 	l := &Log{
 		f:      f,
 		notify: make(chan struct{}, 1),
-		drain:  make(chan chan error),
 		trunc:  make(chan chan error),
 		stop:   make(chan struct{}),
 	}
@@ -98,13 +96,17 @@ func (l *Log) Enqueue(payload []byte) *Commit {
 }
 
 func (l *Log) Drain() error {
-	errc := make(chan error, 1)
-	select {
-	case l.drain <- errc:
-		return <-errc
-	case <-l.stop:
-		return os.ErrClosed
+	l.mu.Lock()
+	if l.commit == nil {
+		l.commit = &Commit{done: make(chan struct{})}
 	}
+	c := l.commit
+	l.mu.Unlock()
+	select {
+	case l.notify <- struct{}{}:
+	default:
+	}
+	return c.Wait()
 }
 
 func (l *Log) Truncate() error {
@@ -138,9 +140,6 @@ func (l *Log) run() {
 		select {
 		case <-l.notify:
 			err = l.write(err)
-		case errc := <-l.drain:
-			err = l.write(err)
-			errc <- err
 		case errc := <-l.trunc:
 			if err == nil {
 				err = l.truncate()

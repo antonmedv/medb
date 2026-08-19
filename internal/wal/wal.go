@@ -24,18 +24,19 @@ type file interface {
 }
 
 type Log struct {
-	f    file
-	size atomic.Int64
-	buf  []byte
+	f      file
+	size   atomic.Int64
+	buf    []byte
+	failed error
 
 	mu      sync.Mutex
 	pending [][]byte
 	spare   [][]byte
 	commit  *Commit
-	failed  error
 
 	notify chan struct{}
 	drain  chan chan error
+	trunc  chan chan error
 	stop   chan struct{}
 	done   sync.WaitGroup
 }
@@ -48,12 +49,6 @@ type Commit struct {
 func (c *Commit) Wait() error {
 	<-c.done
 	return c.err
-}
-
-func settled(err error) *Commit {
-	c := &Commit{done: make(chan struct{}), err: err}
-	close(c.done)
-	return c
 }
 
 func Open(path string) (*Log, error) {
@@ -78,6 +73,7 @@ func newLog(f file, size int64) *Log {
 		f:      f,
 		notify: make(chan struct{}, 1),
 		drain:  make(chan chan error),
+		trunc:  make(chan chan error),
 		stop:   make(chan struct{}),
 	}
 	l.size.Store(size)
@@ -88,11 +84,6 @@ func newLog(f file, size int64) *Log {
 
 func (l *Log) Enqueue(payload []byte) *Commit {
 	l.mu.Lock()
-	if l.failed != nil {
-		c := settled(l.failed)
-		l.mu.Unlock()
-		return c
-	}
 	if l.commit == nil {
 		l.commit = &Commit{done: make(chan struct{})}
 	}
@@ -116,77 +107,60 @@ func (l *Log) Drain() error {
 	}
 }
 
-func (l *Log) Size() int64 {
-	return l.size.Load()
+func (l *Log) Truncate() error {
+	errc := make(chan error, 1)
+	select {
+	case l.trunc <- errc:
+		return <-errc
+	case <-l.stop:
+		return os.ErrClosed
+	}
 }
 
-func (l *Log) Truncate() error {
-	l.mu.Lock()
-	err := l.failed
-	l.mu.Unlock()
-	if err != nil {
-		return err
-	}
-	if err := l.f.Truncate(0); err != nil {
-		l.fail(err)
-		return err
-	}
-	if err := l.f.Sync(); err != nil {
-		l.fail(err)
-		return err
-	}
-	l.size.Store(0)
-	return nil
+func (l *Log) Size() int64 {
+	return l.size.Load()
 }
 
 func (l *Log) Close() error {
 	close(l.stop)
 	l.done.Wait()
 	err := l.f.Close()
-	l.mu.Lock()
 	if l.failed != nil {
 		err = l.failed
 	}
-	l.mu.Unlock()
 	return err
-}
-
-func (l *Log) fail(err error) {
-	l.mu.Lock()
-	if l.failed == nil {
-		l.failed = err
-	}
-	l.mu.Unlock()
 }
 
 func (l *Log) run() {
 	defer l.done.Done()
+	var err error
 	for {
 		select {
 		case <-l.notify:
-			l.write()
+			err = l.write(err)
 		case errc := <-l.drain:
-			l.write()
-			l.mu.Lock()
-			err := l.failed
-			l.mu.Unlock()
+			err = l.write(err)
+			errc <- err
+		case errc := <-l.trunc:
+			if err == nil {
+				err = l.truncate()
+			}
 			errc <- err
 		case <-l.stop:
-			l.write()
+			l.failed = l.write(err)
 			return
 		}
 	}
 }
 
-func (l *Log) write() {
+func (l *Log) write(err error) error {
 	l.mu.Lock()
 	batch, commit := l.pending, l.commit
 	l.pending, l.spare = l.spare[:0], l.pending
 	l.commit = nil
-	err := l.failed
 	l.mu.Unlock()
 	if commit == nil {
-		return
+		return err
 	}
 	if err == nil {
 		l.buf = l.buf[:0]
@@ -199,13 +173,23 @@ func (l *Log) write() {
 		}
 		if err == nil {
 			l.size.Add(int64(len(l.buf)))
-		} else {
-			l.fail(err)
 		}
 	}
 	commit.err = err
 	close(commit.done)
 	clear(batch)
+	return err
+}
+
+func (l *Log) truncate() error {
+	if err := l.f.Truncate(0); err != nil {
+		return err
+	}
+	if err := l.f.Sync(); err != nil {
+		return err
+	}
+	l.size.Store(0)
+	return nil
 }
 
 func Records(path string) ([][]byte, error) {

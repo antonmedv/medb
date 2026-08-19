@@ -240,6 +240,9 @@ func TestDrainAfterClose(t *testing.T) {
 	if err := l.Drain(); !errors.Is(err, os.ErrClosed) {
 		t.Fatalf("got %v, want ErrClosed", err)
 	}
+	if err := l.Truncate(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("got %v, want ErrClosed", err)
+	}
 }
 
 func TestSizeMatchesFile(t *testing.T) {

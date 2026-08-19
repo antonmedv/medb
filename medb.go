@@ -71,13 +71,12 @@ type DB struct {
 	dirty   map[string]bool
 	dropped map[string]bool
 	closed  bool
-	failed  error
 
-	log    *wal.Log
-	flock  *os.File
-	flushc chan struct{}
-	stop   chan struct{}
-	done   sync.WaitGroup
+	log       *wal.Log
+	flock     *os.File
+	snapshotc chan struct{}
+	stop      chan struct{}
+	done      sync.WaitGroup
 }
 
 func Open(dir string, opts ...Option) (*DB, error) {
@@ -105,15 +104,15 @@ func Open(dir string, opts ...Option) (*DB, error) {
 		return nil, err
 	}
 	db := &DB{
-		dir:     filepath.Clean(dir),
-		opts:    o,
-		colls:   map[string]map[string]json.RawMessage{},
-		dirty:   map[string]bool{},
-		dropped: map[string]bool{},
-		log:     log,
-		flock:   flock,
-		flushc:  make(chan struct{}, 1),
-		stop:    make(chan struct{}),
+		dir:       filepath.Clean(dir),
+		opts:      o,
+		colls:     map[string]map[string]json.RawMessage{},
+		dirty:     map[string]bool{},
+		dropped:   map[string]bool{},
+		log:       log,
+		flock:     flock,
+		snapshotc: make(chan struct{}, 1),
+		stop:      make(chan struct{}),
 	}
 	if err := db.load(); err != nil {
 		log.Close()
@@ -145,11 +144,6 @@ func (db *DB) Close() error {
 		err = e
 	}
 
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	if db.failed != nil {
-		err = db.failed
-	}
 	clear(db.colls)
 	clear(db.dirty)
 	clear(db.dropped)
@@ -168,15 +162,7 @@ func (db *DB) Collections() []string {
 func (db *DB) Drop(name string) error {
 	mustValidName(name)
 	rec := walRecord{Op: opDrop, Coll: name}
-	payload, err := encode(rec)
-	if err != nil {
-		return err
-	}
-	t, err := db.stage(rec, payload)
-	if err != nil {
-		return err
-	}
-	return db.commitWait(t)
+	// TODO: write WAL, wait for commit, apply
 }
 
 func NewID() string {
@@ -191,18 +177,7 @@ func (db *DB) writable() error {
 	if db.closed {
 		return ErrClosed
 	}
-	return db.failed
-}
-
-func (db *DB) fail(err error) {
-	if err == nil {
-		return
-	}
-	db.mu.Lock()
-	if db.failed == nil {
-		db.failed = err
-	}
-	db.mu.Unlock()
+	return nil
 }
 
 func (db *DB) checkDocSize(raw []byte) error {

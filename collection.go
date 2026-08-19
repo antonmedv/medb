@@ -7,8 +7,6 @@ import (
 	"iter"
 	"maps"
 	"slices"
-
-	"github.com/antonmedv/medb/internal/wal"
 )
 
 var errEmptyID = errors.New("medb: empty document id")
@@ -50,82 +48,23 @@ func (c *Collection[T]) Set(id string, doc T) error {
 	if err != nil {
 		return err
 	}
-	db := c.db
-	if err := db.checkDocSize(raw); err != nil {
+	if err := c.db.checkDocSize(raw); err != nil {
 		return err
 	}
 	rec := walRecord{Op: opSet, Coll: c.name, ID: id, Doc: raw}
-	payload, err := encode(rec)
-	if err != nil {
-		return err
-	}
-	t, err := db.stage(rec, payload)
-	if err != nil {
-		return err
-	}
-	return db.commitWait(t)
+	// TODO: write WAL, wait for commit, apply
 }
 
 func (c *Collection[T]) Delete(id string) error {
 	if id == "" {
 		return errEmptyID
 	}
-	db := c.db
 	rec := walRecord{Op: opDel, Coll: c.name, ID: id}
-	payload, err := encode(rec)
-	if err != nil {
-		return err
-	}
-	t, err := db.stage(rec, payload)
-	if err != nil {
-		return err
-	}
-	return db.commitWait(t)
+	// TODO: write WAL, wait for commit, apply
 }
 
-// fn runs while holding the database write lock and must not block or call
-// back into the DB.
 func (c *Collection[T]) Update(id string, fn func(T) (T, error)) error {
-	t, err := c.stageUpdate(id, fn)
-	if err != nil {
-		return err
-	}
-	return c.db.commitWait(t)
-}
-
-func (c *Collection[T]) stageUpdate(id string, fn func(T) (T, error)) (wal.Ticket, error) {
-	db := c.db
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	if err := db.writable(); err != nil {
-		return wal.Ticket{}, err
-	}
-	raw, ok := db.colls[c.name][id]
-	if !ok {
-		return wal.Ticket{}, ErrNotFound
-	}
-	var v T
-	if err := json.Unmarshal(raw, &v); err != nil {
-		return wal.Ticket{}, err
-	}
-	v, err := fn(v)
-	if err != nil {
-		return wal.Ticket{}, err
-	}
-	out, err := json.Marshal(v)
-	if err != nil {
-		return wal.Ticket{}, err
-	}
-	if err := db.checkDocSize(out); err != nil {
-		return wal.Ticket{}, err
-	}
-	rec := walRecord{Op: opSet, Coll: c.name, ID: id, Doc: out}
-	payload, err := encode(rec)
-	if err != nil {
-		return wal.Ticket{}, err
-	}
-	db.apply(rec)
-	return db.log.Enqueue(payload), nil
+	// TODO
 }
 
 func (c *Collection[T]) Has(id string) bool {

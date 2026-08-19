@@ -5,10 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"maps"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"time"
 
@@ -23,63 +21,18 @@ func (db *DB) run() {
 	for {
 		select {
 		case <-db.flushc:
-			db.tryFlush()
+			db.snapshot()
 		case <-ticker.C:
-			db.tryFlush()
+			db.snapshot()
 		case <-db.stop:
-			db.tryFlush()
+			db.snapshot()
 			return
 		}
 	}
 }
 
-func (db *DB) tryFlush() {
-	db.mu.RLock()
-	bad := db.failed != nil
-	db.mu.RUnlock()
-	if bad || db.log.Size() == 0 {
-		return
-	}
-	db.fail(db.log.Exec(db.flush))
-}
-
-func (db *DB) flush() error {
-	db.mu.Lock()
-	if db.failed != nil {
-		err := db.failed
-		db.mu.Unlock()
-		return err
-	}
-	if err := db.log.Drain(); err != nil {
-		db.mu.Unlock()
-		return err
-	}
-	snaps := make(map[string]map[string]json.RawMessage, len(db.dirty))
-	for name := range db.dirty {
-		if c, ok := db.colls[name]; ok {
-			snaps[name] = maps.Clone(c)
-		}
-	}
-	dropped := slices.Sorted(maps.Keys(db.dropped))
-	clear(db.dirty)
-	clear(db.dropped)
-	db.mu.Unlock()
-
-	for _, name := range slices.Sorted(maps.Keys(snaps)) {
-		data, err := json.Marshal(snaps[name])
-		if err != nil {
-			return err
-		}
-		if err := db.writeSnapshot(name, data); err != nil {
-			return err
-		}
-	}
-	for _, name := range dropped {
-		if err := db.removeSnapshot(name); err != nil {
-			return err
-		}
-	}
-	return db.log.Truncate()
+func (db *DB) snapshot() {
+	// TODO:
 }
 
 func (db *DB) removeSnapshot(name string) error {
@@ -93,27 +46,6 @@ func (db *DB) removeSnapshot(name string) error {
 		return err
 	}
 	return fsutil.SyncDir(filepath.Dir(path))
-}
-
-func (db *DB) writeSnapshot(name string, data []byte) error {
-	path := db.collPath(name)
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	if err := fsutil.WriteFile(path, data); err != nil {
-		return err
-	}
-	for d := filepath.Dir(path); d != db.dir; {
-		parent := filepath.Dir(d)
-		if parent == d {
-			return fmt.Errorf("medb: snapshot path %s escapes %s", path, db.dir)
-		}
-		d = parent
-		if err := fsutil.SyncDir(d); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (db *DB) load() error {
@@ -156,13 +88,8 @@ func (db *DB) replay() error {
 		if err := json.Unmarshal(payload, &rec); err != nil {
 			return fmt.Errorf("medb: corrupt wal record %d in %s: %w", i+1, db.walPath(), err)
 		}
-		if err := rec.valid(); err != nil {
-			return fmt.Errorf("medb: invalid wal record %d in %s: %w", i+1, db.walPath(), err)
-		}
 		db.apply(rec)
 	}
-	if db.log.Size() > 0 {
-		return db.log.Exec(db.flush)
-	}
+	// TODO: we need to snapshot?
 	return nil
 }

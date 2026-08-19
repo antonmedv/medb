@@ -43,50 +43,77 @@ func (db *DB) tryFlush() {
 	db.fail(db.log.Exec(db.flush))
 }
 
+// flush is safe to run while writers append because it runs inside log.Exec:
+// no commit happens until it returns, so any record it does not capture in a
+// snapshot is still queued and survives the truncate.
 func (db *DB) flush() error {
-	db.mu.Lock()
-	if db.failed != nil {
-		err := db.failed
-		db.mu.Unlock()
-		return err
+	db.mu.RLock()
+	failed := db.failed
+	dirty := slices.Sorted(maps.Keys(db.dirty))
+	dropped := slices.Sorted(maps.Keys(db.dropped))
+	db.mu.RUnlock()
+	if failed != nil {
+		return failed
 	}
-	snaps := make(map[string][]byte, len(db.dirty))
-	for name := range db.dirty {
-		c, ok := db.colls[name]
-		if !ok {
-			continue
-		}
-		data, err := json.Marshal(c)
-		if err != nil {
-			db.mu.Unlock()
-			return err
-		}
-		snaps[name] = data
-	}
-	removed := slices.Sorted(maps.Keys(db.dropped))
-	clear(db.dirty)
-	clear(db.dropped)
-	db.mu.Unlock()
 
-	for name, data := range snaps {
-		if err := db.writeSnapshot(name, data); err != nil {
+	for _, name := range dirty {
+		if err := db.flushCollection(name); err != nil {
 			return err
 		}
 	}
-	for _, name := range removed {
-		path := db.collPath(name)
-		err := os.Remove(path)
-		if errors.Is(err, fs.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return err
-		}
-		if err := fsutil.SyncDir(filepath.Dir(path)); err != nil {
+	for _, name := range dropped {
+		if err := db.dropCollection(name); err != nil {
 			return err
 		}
 	}
 	return db.log.Truncate()
+}
+
+func (db *DB) flushCollection(name string) error {
+	db.mu.RLock()
+	version, dirty := db.dirty[name]
+	snap := maps.Clone(db.colls[name])
+	db.mu.RUnlock()
+	if !dirty || snap == nil {
+		return nil
+	}
+
+	data, err := json.Marshal(snap)
+	if err != nil {
+		return err
+	}
+	if err := db.writeSnapshot(name, data); err != nil {
+		return err
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.dirty[name] == version {
+		delete(db.dirty, name)
+	}
+	return nil
+}
+
+func (db *DB) dropCollection(name string) error {
+	db.mu.RLock()
+	_, live := db.colls[name]
+	db.mu.RUnlock()
+	if live {
+		return nil
+	}
+
+	path := db.collPath(name)
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	if err := fsutil.SyncDir(filepath.Dir(path)); err != nil {
+		return err
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	delete(db.dropped, name)
+	return nil
 }
 
 func (db *DB) writeSnapshot(name string, data []byte) error {

@@ -18,6 +18,11 @@ import (
 	"github.com/antonmedv/medb/internal/wal"
 )
 
+const (
+	walName  = "wal.log"
+	lockName = "LOCK"
+)
+
 var (
 	ErrNotFound = errors.New("medb: document not found")
 	ErrLocked   = lock.ErrLocked
@@ -64,8 +69,9 @@ type DB struct {
 
 	mu      sync.RWMutex
 	colls   map[string]map[string]json.RawMessage
-	dirty   map[string]bool
+	dirty   map[string]uint64
 	dropped map[string]bool
+	seq     uint64
 	closed  bool
 	failed  error
 
@@ -91,11 +97,11 @@ func Open(dir string, opts ...Option) (*DB, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	flock, err := lock.Acquire(filepath.Join(dir, "LOCK"))
+	flock, err := lock.Acquire(filepath.Join(dir, lockName))
 	if err != nil {
 		return nil, err
 	}
-	log, err := wal.Open(filepath.Join(dir, "wal.log"))
+	log, err := wal.Open(filepath.Join(dir, walName))
 	if err != nil {
 		flock.Close()
 		return nil, err
@@ -104,7 +110,7 @@ func Open(dir string, opts ...Option) (*DB, error) {
 		dir:     filepath.Clean(dir),
 		opts:    o,
 		colls:   map[string]map[string]json.RawMessage{},
-		dirty:   map[string]bool{},
+		dirty:   map[string]uint64{},
 		dropped: map[string]bool{},
 		log:     log,
 		flock:   flock,
@@ -213,7 +219,7 @@ func (db *DB) collPath(name string) string {
 }
 
 func (db *DB) walPath() string {
-	return filepath.Join(db.dir, "wal.log")
+	return filepath.Join(db.dir, walName)
 }
 
 func validName(name string) bool {

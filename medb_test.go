@@ -717,3 +717,93 @@ func TestInvalidOptions(t *testing.T) {
 		})
 	}
 }
+
+// Writes that land while a flush is encoding a collection must stay marked
+// dirty, or the next flush truncates their records without snapshotting them.
+func TestWritesDuringFlushSurvive(t *testing.T) {
+	dir := t.TempDir()
+	db := open(t, dir, medb.WithFlushBytes(1), medb.WithFlushInterval(time.Hour))
+	users := medb.C[user](db, "users")
+
+	const writers, each = 8, 30
+	var wg sync.WaitGroup
+	for w := range writers {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := range each {
+				id := fmt.Sprintf("w%d-%d", w, i)
+				if err := users.Set(id, user{Name: id}); err != nil {
+					t.Error(err)
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	want := users.Count()
+	if want != writers*each {
+		t.Fatalf("in memory %d documents, want %d", want, writers*each)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened := open(t, dir)
+	defer reopened.Close()
+	got := medb.C[user](reopened, "users")
+	if n := got.Count(); n != want {
+		t.Fatalf("reopened with %d documents, want %d", n, want)
+	}
+	for w := range writers {
+		for i := range each {
+			if id := fmt.Sprintf("w%d-%d", w, i); !got.Has(id) {
+				t.Errorf("document %s lost", id)
+			}
+		}
+	}
+}
+
+// The last write to a collection is the one at risk: if a flush clears the
+// dirty mark it did not capture, no later write re-marks the collection and
+// the next truncate discards the record with no snapshot holding it.
+func TestLastWriteDuringFlushSurvives(t *testing.T) {
+	dir := t.TempDir()
+	big := strings.Repeat("x", 1<<20)
+
+	db := open(t, dir, medb.WithFlushBytes(1<<30), medb.WithFlushInterval(time.Hour))
+	users := medb.C[user](db, "users")
+	for i := range 50 {
+		if err := users.Set(fmt.Sprintf("big%d", i), user{Name: big}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopened with a byte threshold of 1, the next commit starts a flush that
+	// spends a long time encoding 50 MB. "late" lands inside that window.
+	db = open(t, dir, medb.WithFlushBytes(1), medb.WithFlushInterval(time.Hour))
+	users = medb.C[user](db, "users")
+	if err := users.Set("trigger", user{Name: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(25 * time.Millisecond)
+	if err := users.Set("late", user{Name: "late"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened := open(t, dir)
+	defer reopened.Close()
+	got := medb.C[user](reopened, "users")
+	if !got.Has("trigger") {
+		t.Error(`document "trigger" lost`)
+	}
+	if !got.Has("late") {
+		t.Error(`document "late" lost: its dirty mark was cleared by a flush that did not capture it`)
+	}
+}

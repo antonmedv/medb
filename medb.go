@@ -130,27 +130,25 @@ func (db *DB) Close() error {
 	db.closed = true
 	db.mu.Unlock()
 
+	// The lock must be free here: the final flush runs on the flusher
+	// goroutine and takes db.mu, so waiting for it while holding the lock
+	// deadlocks.
 	close(db.stop)
 	db.done.Wait()
 
-	db.mu.Lock()
-	err := db.failed
-	db.mu.Unlock()
-	if e := db.log.Close(); err == nil {
-		err = e
-	}
+	err := db.log.Close()
 	if e := db.flock.Close(); err == nil {
 		err = e
 	}
 
-	// Only after the flusher and the log are stopped: the final flush reads
-	// these maps, and clearing them any earlier would snapshot an empty
-	// database over the real one.
 	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.failed != nil {
+		err = db.failed
+	}
 	clear(db.colls)
 	clear(db.dirty)
 	clear(db.dropped)
-	db.mu.Unlock()
 	return err
 }
 

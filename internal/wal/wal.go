@@ -22,40 +22,21 @@ type Log struct {
 	mu      sync.Mutex
 	pending [][]byte
 	spare   [][]byte
-	group   *group
-	failed  error
+	commit  *Commit
 
 	notify chan struct{}
-	exec   chan execReq
 	stop   chan struct{}
 	done   sync.WaitGroup
 }
 
-// Every record in one commit shares a group: closing done broadcasts the
-// single write-and-sync result to all of its waiters.
-type group struct {
+type Commit struct {
 	done chan struct{}
 	err  error
 }
 
-func settled(err error) *group {
-	g := &group{done: make(chan struct{}), err: err}
-	close(g.done)
-	return g
-}
-
-type execReq struct {
-	fn  func() error
-	err chan error
-}
-
-type Ticket struct {
-	group *group
-}
-
-func (t Ticket) Wait() error {
-	<-t.group.done
-	return t.group.err
+func (t *Commit) Wait() error {
+	<-t.done
+	return t.err
 }
 
 func Open(path string) (*Log, error) {
@@ -75,7 +56,6 @@ func newLog(f file, size int64) *Log {
 	l := &Log{
 		f:      f,
 		notify: make(chan struct{}, 1),
-		exec:   make(chan execReq),
 		stop:   make(chan struct{}),
 	}
 	l.size.Store(size)
@@ -84,46 +64,22 @@ func newLog(f file, size int64) *Log {
 	return l
 }
 
-func (l *Log) Enqueue(payload []byte) Ticket {
+func (l *Log) Enqueue(payload []byte) *Commit {
 	l.mu.Lock()
-	if l.failed != nil {
-		err := l.failed
-		l.mu.Unlock()
-		return Ticket{settled(err)}
+	if l.commit == nil {
+		l.commit = &Commit{done: make(chan struct{})}
 	}
-	if l.group == nil {
-		l.group = &group{done: make(chan struct{})}
-	}
-	t := Ticket{l.group}
 	l.pending = append(l.pending, payload)
 	l.mu.Unlock()
 	select {
 	case l.notify <- struct{}{}:
 	default:
 	}
-	return t
-}
-
-// Exec runs fn in the commit goroutine after draining pending records,
-// so nothing is appended to the log while fn runs.
-func (l *Log) Exec(fn func() error) error {
-	req := execReq{fn, make(chan error, 1)}
-	l.exec <- req
-	return <-req.err
+	return l.commit
 }
 
 func (l *Log) Size() int64 {
 	return l.size.Load()
-}
-
-// Drain commits every queued record. Called from inside Exec, where fn owns the
-// commit goroutine, it makes the log hold everything enqueued so far, including
-// the records that arrived while the previous commit was syncing.
-func (l *Log) Drain() error {
-	l.commit()
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.failed
 }
 
 func (l *Log) Truncate() error {
@@ -148,59 +104,40 @@ func (l *Log) run() {
 	for {
 		select {
 		case <-l.notify:
-			l.commit()
-		case req := <-l.exec:
-			// Draining records a failure synchronously, so checking here keeps a
-			// poisoned log from being snapshotted and truncated.
-			if err := l.Drain(); err != nil {
-				req.err <- err
-				continue
-			}
-			req.err <- req.fn()
+			l.doCommit()
 		case <-l.stop:
-			l.commit()
+			l.doCommit()
 			return
 		}
 	}
 }
 
-func (l *Log) commit() {
+func (l *Log) doCommit() {
 	l.mu.Lock()
-	batch := l.pending
-	g := l.group
+	batch, commit := l.pending, l.commit
 	l.pending, l.spare = l.spare[:0], l.pending
-	l.group = nil
-	err := l.failed
+	l.commit = nil
 	l.mu.Unlock()
-	if g == nil {
+	if commit == nil {
 		return
 	}
-	if err == nil {
-		l.buf = l.buf[:0]
-		for _, payload := range batch {
-			l.buf = append(l.buf, payload...)
-			l.buf = append(l.buf, '\n')
-		}
-		if _, err = l.f.Write(l.buf); err == nil {
-			err = l.f.Sync()
-		}
-		if err == nil {
-			l.size.Add(int64(len(l.buf)))
-		} else {
-			l.mu.Lock()
-			if l.failed == nil {
-				l.failed = err
-			}
-			l.mu.Unlock()
-		}
+	var err error
+	l.buf = l.buf[:0]
+	for _, payload := range batch {
+		l.buf = append(l.buf, payload...)
+		l.buf = append(l.buf, '\n')
 	}
-	g.err = err
-	close(g.done)
+	if _, err = l.f.Write(l.buf); err == nil {
+		err = l.f.Sync()
+	}
+	if err == nil {
+		l.size.Add(int64(len(l.buf)))
+	}
+	commit.err = err
+	close(commit.done)
 	clear(batch)
 }
 
-// Records returns the complete records in the log. A record interrupted by a
-// crash lacks its newline and is discarded, along with anything after it.
 func Records(path string) ([][]byte, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

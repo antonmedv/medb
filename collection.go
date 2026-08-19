@@ -128,6 +128,9 @@ func (c *Collection[T]) stageUpdate(id string, fn func(T) (T, error)) (wal.Ticke
 func (c *Collection[T]) Has(id string) bool {
 	c.db.mu.RLock()
 	defer c.db.mu.RUnlock()
+	if c.db.closed {
+		return false
+	}
 	_, ok := c.db.colls[c.name][id]
 	return ok
 }
@@ -135,12 +138,19 @@ func (c *Collection[T]) Has(id string) bool {
 func (c *Collection[T]) Count() int {
 	c.db.mu.RLock()
 	defer c.db.mu.RUnlock()
+	if c.db.closed {
+		return 0
+	}
 	return len(c.db.colls[c.name])
 }
 
 func (c *Collection[T]) All() iter.Seq2[string, T] {
 	return func(yield func(string, T) bool) {
 		c.db.mu.RLock()
+		if c.db.closed {
+			c.db.mu.RUnlock()
+			return
+		}
 		snap := maps.Clone(c.db.colls[c.name])
 		c.db.mu.RUnlock()
 		for _, id := range slices.Sorted(maps.Keys(snap)) {

@@ -633,3 +633,61 @@ func TestMarshalPanicKeepsDBUsable(t *testing.T) {
 		t.Fatal("db.mu still held after a panic inside json.Marshal")
 	}
 }
+
+func TestClosedReadsAreEmpty(t *testing.T) {
+	db := open(t, t.TempDir())
+	users := medb.C[user](db, "users")
+	if err := users.Set("a", user{Name: "A"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := users.Get("a"); !errors.Is(err, medb.ErrClosed) {
+		t.Errorf("Get: got %v, want ErrClosed", err)
+	}
+	if users.Has("a") {
+		t.Error("Has reported a document from a closed database")
+	}
+	if n := users.Count(); n != 0 {
+		t.Errorf("Count = %d, want 0", n)
+	}
+	if got := db.Collections(); len(got) != 0 {
+		t.Errorf("Collections = %v, want none", got)
+	}
+	n := 0
+	for range users.All() {
+		n++
+	}
+	if n != 0 {
+		t.Errorf("All yielded %d documents from a closed database", n)
+	}
+}
+
+func TestInvalidOptions(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opt  medb.Option
+	}{
+		{"zero doc size", medb.WithMaxDocSize(0)},
+		{"negative doc size", medb.WithMaxDocSize(-1)},
+		{"zero flush bytes", medb.WithFlushBytes(0)},
+		{"negative flush bytes", medb.WithFlushBytes(-1)},
+		{"zero flush interval", medb.WithFlushInterval(0)},
+		{"negative flush interval", medb.WithFlushInterval(-time.Second)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "data")
+			db, err := medb.Open(dir, tc.opt)
+			if err == nil {
+				db.Close()
+				t.Fatal("Open accepted an invalid option")
+			}
+			t.Log(err)
+			if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("Open created %s after rejecting the options", dir)
+			}
+		})
+	}
+}

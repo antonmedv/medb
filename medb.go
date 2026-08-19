@@ -45,6 +45,19 @@ func WithFlushInterval(d time.Duration) Option {
 	return func(o *options) { o.flushInterval = d }
 }
 
+func (o options) validate() error {
+	if o.maxDocSize <= 0 {
+		return fmt.Errorf("medb: max document size must be positive, got %d", o.maxDocSize)
+	}
+	if o.flushBytes <= 0 {
+		return fmt.Errorf("medb: flush threshold must be positive, got %d", o.flushBytes)
+	}
+	if o.flushInterval <= 0 {
+		return fmt.Errorf("medb: flush interval must be positive, got %s", o.flushInterval)
+	}
+	return nil
+}
+
 type DB struct {
 	dir  string
 	opts options
@@ -71,6 +84,9 @@ func Open(dir string, opts ...Option) (*DB, error) {
 	}
 	for _, opt := range opts {
 		opt(&o)
+	}
+	if err := o.validate(); err != nil {
+		return nil, err
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
@@ -132,6 +148,9 @@ func (db *DB) Close() error {
 func (db *DB) Collections() []string {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
+	if db.closed {
+		return nil
+	}
 	return slices.Sorted(maps.Keys(db.colls))
 }
 

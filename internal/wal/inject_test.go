@@ -10,6 +10,7 @@ type fakeFile struct {
 	mu        sync.Mutex
 	written   []byte
 	syncs     int
+	truncs    int
 	writeErr  error
 	syncErr   error
 	truncErr  error
@@ -40,6 +41,7 @@ func (f *fakeFile) Truncate(int64) error {
 	if f.truncErr != nil {
 		return f.truncErr
 	}
+	f.truncs++
 	f.written = nil
 	return nil
 }
@@ -69,9 +71,79 @@ func (f *fakeFile) syncCount() int {
 	return f.syncs
 }
 
-// A failed commit must poison the log: every later Enqueue reports the
-// original failure instead of silently accepting writes it cannot durably
-// store.
+func (f *fakeFile) truncCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.truncs
+}
+
+type gatedFile struct {
+	fakeFile
+	entered chan struct{}
+	release chan struct{}
+}
+
+func newGatedFile() *gatedFile {
+	return &gatedFile{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (f *gatedFile) Write(p []byte) (int, error) {
+	f.entered <- struct{}{}
+	<-f.release
+	return f.fakeFile.Write(p)
+}
+
+func TestSyncBeforeAck(t *testing.T) {
+	f := &fakeFile{}
+	l := newLog(f, 0)
+	defer l.Close()
+
+	if err := l.Enqueue([]byte("rec")).Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if f.syncCount() == 0 {
+		t.Fatal("acknowledged before any fsync")
+	}
+	if got := f.contents(); got != "rec\n" {
+		t.Fatalf("file holds %q at ack time, want %q", got, "rec\n")
+	}
+}
+
+func TestGroupCommitBatches(t *testing.T) {
+	f := newGatedFile()
+	l := newLog(f, 0)
+	defer l.Close()
+
+	c1 := l.Enqueue([]byte("a"))
+	<-f.entered // batch {a} is being written
+	c2 := l.Enqueue([]byte("b"))
+	c3 := l.Enqueue([]byte("c"))
+	if c1 == c2 {
+		t.Fatal("record enqueued mid-commit joined the batch already on disk")
+	}
+	if c2 != c3 {
+		t.Fatal("records enqueued while a commit is in flight do not share a batch")
+	}
+	f.release <- struct{}{}
+	<-f.entered // batch {b, c}
+	f.release <- struct{}{}
+
+	for i, c := range []*Commit{c1, c2, c3} {
+		if err := c.Wait(); err != nil {
+			t.Fatalf("record %d: %v", i, err)
+		}
+	}
+	if got := f.contents(); got != "a\nb\nc\n" {
+		t.Fatalf("file holds %q, want records in enqueue order", got)
+	}
+	if n := f.syncCount(); n != 2 {
+		t.Fatalf("%d fsyncs for two batches, want 2", n)
+	}
+}
+
 func TestSyncFailureIsFailStop(t *testing.T) {
 	want := errors.New("sync failed")
 	f := &fakeFile{syncErr: want}
@@ -88,6 +160,9 @@ func TestSyncFailureIsFailStop(t *testing.T) {
 	}
 	if n := f.syncCount(); n != 1 {
 		t.Fatalf("%d syncs attempted, want 1: the log kept writing after a failure", n)
+	}
+	if got := f.contents(); got != "a\n" {
+		t.Fatalf("file holds %q after the failure, want only the first batch", got)
 	}
 	if l.Size() != 0 {
 		t.Fatalf("Size()=%d after a failed commit, want 0", l.Size())
@@ -120,14 +195,40 @@ func TestFailureReachesEveryWaiter(t *testing.T) {
 	l := newLog(f, 0)
 	defer l.Close()
 
-	tickets := make([]Ticket, 8)
-	for i := range tickets {
-		tickets[i] = l.Enqueue([]byte("rec"))
+	commits := make([]*Commit, 8)
+	for i := range commits {
+		commits[i] = l.Enqueue([]byte("rec"))
 	}
-	for i, ticket := range tickets {
-		if err := ticket.Wait(); !errors.Is(err, want) {
+	for i, c := range commits {
+		if err := c.Wait(); !errors.Is(err, want) {
 			t.Fatalf("waiter %d: got %v, want %v", i, err, want)
 		}
+	}
+}
+
+func TestQueuedRecordsNeverWrittenAfterFailure(t *testing.T) {
+	want := errors.New("sync failed")
+	f := newGatedFile()
+	f.syncErr = want
+	l := newLog(f, 0)
+	defer l.Close()
+
+	c1 := l.Enqueue([]byte("a"))
+	<-f.entered // batch {a} is being written, its sync will fail
+	c2 := l.Enqueue([]byte("b"))
+	f.release <- struct{}{}
+
+	if err := c1.Wait(); !errors.Is(err, want) {
+		t.Fatalf("failing batch: got %v, want %v", err, want)
+	}
+	if err := c2.Wait(); !errors.Is(err, want) {
+		t.Fatalf("queued batch: got %v, want %v", err, want)
+	}
+	if got := f.contents(); got != "a\n" {
+		t.Fatalf("file holds %q; the queued record reached a failed fd", got)
+	}
+	if n := f.syncCount(); n != 1 {
+		t.Fatalf("%d syncs, want 1: the queued batch was attempted", n)
 	}
 }
 
@@ -166,52 +267,14 @@ func TestTruncateFailure(t *testing.T) {
 	if err := l.Enqueue([]byte("rec")).Wait(); err != nil {
 		t.Fatal(err)
 	}
-	if err := l.Exec(l.Truncate); !errors.Is(err, want) {
+	if err := l.Truncate(); !errors.Is(err, want) {
 		t.Fatalf("got %v, want %v", err, want)
 	}
 	if l.Size() == 0 {
 		t.Fatal("Size() reset despite a failed truncate")
 	}
-}
-
-// A poisoned log must not run a flush: medb truncates the log inside Exec, so
-// running fn here would make a write that failed durable and destroy the log.
-func TestExecSkippedAfterFailure(t *testing.T) {
-	want := errors.New("sync failed")
-	f := &fakeFile{syncErr: want}
-	l := newLog(f, 0)
-	defer l.Close()
-
-	if err := l.Enqueue([]byte("a")).Wait(); !errors.Is(err, want) {
-		t.Fatalf("got %v, want %v", err, want)
-	}
-	ran := false
-	err := l.Exec(func() error {
-		ran = true
-		return nil
-	})
-	if !errors.Is(err, want) {
-		t.Fatalf("Exec returned %v, want %v", err, want)
-	}
-	if ran {
-		t.Fatal("fn ran on a poisoned log")
-	}
-}
-
-func TestExecRunsWhileHealthy(t *testing.T) {
-	f := &fakeFile{}
-	l := newLog(f, 0)
-	defer l.Close()
-
-	if err := l.Enqueue([]byte("a")).Wait(); err != nil {
-		t.Fatal(err)
-	}
-	ran := false
-	if err := l.Exec(func() error { ran = true; return nil }); err != nil {
-		t.Fatal(err)
-	}
-	if !ran {
-		t.Fatal("fn did not run on a healthy log")
+	if err := l.Enqueue([]byte("more")).Wait(); !errors.Is(err, want) {
+		t.Fatalf("Enqueue after a failed truncate: got %v, want %v", err, want)
 	}
 }
 
@@ -224,7 +287,7 @@ func TestTruncateSyncs(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := f.syncCount()
-	if err := l.Exec(l.Truncate); err != nil {
+	if err := l.Truncate(); err != nil {
 		t.Fatal(err)
 	}
 	if f.syncCount() == before {
@@ -242,17 +305,34 @@ func TestTruncateSyncFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.fail(nil, want)
-	if err := l.Exec(l.Truncate); !errors.Is(err, want) {
+	if err := l.Truncate(); !errors.Is(err, want) {
 		t.Fatalf("got %v, want %v", err, want)
 	}
 	if l.Size() == 0 {
 		t.Fatal("Size() reset despite a failed sync")
 	}
+	if err := l.Enqueue([]byte("more")).Wait(); !errors.Is(err, want) {
+		t.Fatalf("Enqueue after a failed truncate sync: got %v, want %v", err, want)
+	}
 }
 
-// A record enqueued while fn owns the commit goroutine has no other way to
-// reach the log: Drain is how fn catches the log up to memory before it
-// snapshots and truncates.
+func TestTruncateRefusedOnPoisonedLog(t *testing.T) {
+	want := errors.New("sync failed")
+	f := &fakeFile{syncErr: want}
+	l := newLog(f, 0)
+	defer l.Close()
+
+	if err := l.Enqueue([]byte("a")).Wait(); !errors.Is(err, want) {
+		t.Fatalf("got %v, want %v", err, want)
+	}
+	if err := l.Truncate(); !errors.Is(err, want) {
+		t.Fatalf("Truncate on a poisoned log: got %v, want %v", err, want)
+	}
+	if n := f.truncCount(); n != 0 {
+		t.Fatalf("ftruncate reached the file %d times on a poisoned log", n)
+	}
+}
+
 func TestDrain(t *testing.T) {
 	f := &fakeFile{}
 	l := newLog(f, 0)
@@ -261,10 +341,8 @@ func TestDrain(t *testing.T) {
 	if err := l.Drain(); err != nil {
 		t.Fatalf("draining an empty log: %v", err)
 	}
-	if err := l.Exec(func() error {
-		l.Enqueue([]byte("late"))
-		return l.Drain()
-	}); err != nil {
+	l.Enqueue([]byte("late"))
+	if err := l.Drain(); err != nil {
 		t.Fatal(err)
 	}
 	if got := f.contents(); got != "late\n" {
@@ -277,23 +355,72 @@ func TestDrain(t *testing.T) {
 
 func TestDrainReportsFailure(t *testing.T) {
 	want := errors.New("sync failed")
-	f := &fakeFile{}
+	f := &fakeFile{syncErr: want}
 	l := newLog(f, 0)
 	defer l.Close()
 
-	f.fail(nil, want)
-	var drainErr error
-	if err := l.Exec(func() error {
-		l.Enqueue([]byte("doomed"))
-		drainErr = l.Drain()
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if !errors.Is(drainErr, want) {
-		t.Fatalf("Drain returned %v, want %v", drainErr, want)
+	l.Enqueue([]byte("doomed"))
+	if err := l.Drain(); !errors.Is(err, want) {
+		t.Fatalf("Drain returned %v, want %v", err, want)
 	}
 	if l.Size() != 0 {
 		t.Fatalf("size %d after a failed sync, want 0", l.Size())
+	}
+}
+
+func TestDrainReportsEarlierFailure(t *testing.T) {
+	want := errors.New("sync failed")
+	f := &fakeFile{syncErr: want}
+	l := newLog(f, 0)
+	defer l.Close()
+
+	if err := l.Enqueue([]byte("a")).Wait(); !errors.Is(err, want) {
+		t.Fatalf("got %v, want %v", err, want)
+	}
+	if err := l.Drain(); !errors.Is(err, want) {
+		t.Fatalf("Drain returned %v, want %v", err, want)
+	}
+}
+
+func TestCloseCommitsPending(t *testing.T) {
+	f := &fakeFile{}
+	l := newLog(f, 0)
+
+	c := l.Enqueue([]byte("rec"))
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.contents(); got != "rec\n" {
+		t.Fatalf("log holds %q after Close, want %q", got, "rec\n")
+	}
+	if !f.closeDone {
+		t.Fatal("file not closed")
+	}
+}
+
+func TestCloseReportsFailure(t *testing.T) {
+	want := errors.New("sync failed")
+	f := &fakeFile{syncErr: want}
+	l := newLog(f, 0)
+
+	l.Enqueue([]byte("rec"))
+	if err := l.Close(); !errors.Is(err, want) {
+		t.Fatalf("Close returned %v, want %v", err, want)
+	}
+}
+
+func TestCloseReportsCloseError(t *testing.T) {
+	want := errors.New("close failed")
+	f := &fakeFile{closeErr: want}
+	l := newLog(f, 0)
+
+	if err := l.Enqueue([]byte("rec")).Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Close(); !errors.Is(err, want) {
+		t.Fatalf("Close returned %v, want %v", err, want)
 	}
 }

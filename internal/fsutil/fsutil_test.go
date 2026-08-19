@@ -1,4 +1,4 @@
-package fsutil
+package fsutil_test
 
 import (
 	"bytes"
@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/antonmedv/medb/internal/fsutil"
 )
 
 func read(t *testing.T, path string) []byte {
@@ -29,7 +31,7 @@ func TestWriteFile(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "data")
-			if err := WriteFile(path, tc.data); err != nil {
+			if err := fsutil.WriteFile(path, tc.data); err != nil {
 				t.Fatal(err)
 			}
 			if got := read(t, path); !bytes.Equal(got, tc.data) {
@@ -44,10 +46,10 @@ func TestWriteFile(t *testing.T) {
 
 func TestWriteFileOverwrite(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "data")
-	if err := WriteFile(path, []byte("old and longer")); err != nil {
+	if err := fsutil.WriteFile(path, []byte("old and longer")); err != nil {
 		t.Fatal(err)
 	}
-	if err := WriteFile(path, []byte("new")); err != nil {
+	if err := fsutil.WriteFile(path, []byte("new")); err != nil {
 		t.Fatal(err)
 	}
 	if got := read(t, path); string(got) != "new" {
@@ -60,13 +62,13 @@ func TestWriteFileOverwrite(t *testing.T) {
 func TestWriteFileFailureKeepsOldContents(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "data")
 	old := []byte("old")
-	if err := WriteFile(path, old); err != nil {
+	if err := fsutil.WriteFile(path, old); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Mkdir(path+".tmp", 0o755); err != nil { // makes os.Create fail
+	if err := os.Mkdir(path+".tmp", 0o700); err != nil { // makes creating the temp file fail
 		t.Fatal(err)
 	}
-	if err := WriteFile(path, []byte("new")); err == nil {
+	if err := fsutil.WriteFile(path, []byte("new")); err == nil {
 		t.Fatal("want error, got nil")
 	}
 	if got := read(t, path); !bytes.Equal(got, old) {
@@ -76,30 +78,44 @@ func TestWriteFileFailureKeepsOldContents(t *testing.T) {
 
 func TestWriteFileRenameFailure(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "data")
-	if err := os.Mkdir(path, 0o755); err != nil { // makes os.Rename fail
+	if err := os.Mkdir(path, 0o700); err != nil { // makes os.Rename fail
 		t.Fatal(err)
 	}
-	if err := WriteFile(path, []byte("new")); err == nil {
+	if err := fsutil.WriteFile(path, []byte("new")); err == nil {
 		t.Fatal("want error, got nil")
 	}
 }
 
 func TestWriteFileMissingParent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing", "data")
-	err := WriteFile(path, []byte("x"))
+	err := fsutil.WriteFile(path, []byte("x"))
 	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("got %v, want ErrNotExist", err)
 	}
 }
 
+func TestPermissions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data")
+	if err := fsutil.WriteFile(path, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		t.Errorf("mode %v, want no group or world access", perm)
+	}
+}
+
 func TestSyncDir(t *testing.T) {
-	if err := SyncDir(t.TempDir()); err != nil {
+	if err := fsutil.SyncDir(t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestSyncDirMissing(t *testing.T) {
-	err := SyncDir(filepath.Join(t.TempDir(), "missing"))
+	err := fsutil.SyncDir(filepath.Join(t.TempDir(), "missing"))
 	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("got %v, want ErrNotExist", err)
 	}

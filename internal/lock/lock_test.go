@@ -1,24 +1,26 @@
 //go:build darwin || linux || freebsd || netbsd || openbsd
 
-package lock
+package lock_test
 
 import (
 	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/antonmedv/medb/internal/lock"
 )
 
 func TestAcquire(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "LOCK")
-	f, err := Acquire(path)
+	f, err := lock.Acquire(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("lock file not created: %v", err)
 	}
-	if _, err := Acquire(path); !errors.Is(err, ErrLocked) {
+	if _, err := lock.Acquire(path); !errors.Is(err, lock.ErrLocked) {
 		t.Fatalf("second Acquire: got %v, want ErrLocked", err)
 	}
 	if err := f.Close(); err != nil {
@@ -27,7 +29,7 @@ func TestAcquire(t *testing.T) {
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("lock file removed on release: %v", err)
 	}
-	again, err := Acquire(path)
+	again, err := lock.Acquire(path)
 	if err != nil {
 		t.Fatalf("reacquire after release: %v", err)
 	}
@@ -35,8 +37,8 @@ func TestAcquire(t *testing.T) {
 }
 
 func TestOpenFailureIsNotErrLocked(t *testing.T) {
-	_, err := Acquire(filepath.Join(t.TempDir(), "missing", "LOCK"))
-	if errors.Is(err, ErrLocked) {
+	_, err := lock.Acquire(filepath.Join(t.TempDir(), "missing", "LOCK"))
+	if errors.Is(err, lock.ErrLocked) {
 		t.Fatal("open failure reported as ErrLocked")
 	}
 	if !errors.Is(err, os.ErrNotExist) {

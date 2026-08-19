@@ -1,8 +1,10 @@
 package wal_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/antonmedv/medb/internal/wal"
@@ -62,6 +64,50 @@ func TestEnqueueAndRecords(t *testing.T) {
 	for i, rec := range recs {
 		if string(rec) != want[i] {
 			t.Fatalf("record %d is %q, want %q", i, rec, want[i])
+		}
+	}
+}
+
+// Records batched together must survive verbatim: a buffer reused across
+// commits can overwrite a batch still being written or acked.
+func TestConcurrentEnqueue(t *testing.T) {
+	const writers, each = 16, 50
+	path := filepath.Join(t.TempDir(), "wal.log")
+	l := open(t, path)
+
+	var wg sync.WaitGroup
+	for w := range writers {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := range each {
+				if err := l.Enqueue([]byte(fmt.Sprintf("w%d-r%d", w, i))).Wait(); err != nil {
+					t.Error(err)
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	recs := records(t, path)
+	if len(recs) != writers*each {
+		t.Fatalf("got %d records, want %d", len(recs), writers*each)
+	}
+	seen := make(map[string]bool, len(recs))
+	for _, r := range recs {
+		if seen[string(r)] {
+			t.Fatalf("duplicate record %q", r)
+		}
+		seen[string(r)] = true
+	}
+	for w := range writers {
+		for i := range each {
+			if want := fmt.Sprintf("w%d-r%d", w, i); !seen[want] {
+				t.Errorf("missing record %q", want)
+			}
 		}
 	}
 }

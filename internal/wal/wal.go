@@ -13,7 +13,9 @@ type Log struct {
 	buf  []byte
 
 	mu      sync.Mutex
-	pending []request
+	pending [][]byte
+	spare   [][]byte
+	group   *group
 	failed  error
 
 	notify chan struct{}
@@ -22,9 +24,17 @@ type Log struct {
 	done   sync.WaitGroup
 }
 
-type request struct {
-	payload []byte
-	done    chan error
+// Every record in one commit shares a group: closing done broadcasts the
+// single write-and-sync result to all of its waiters.
+type group struct {
+	done chan struct{}
+	err  error
+}
+
+func settled(err error) *group {
+	g := &group{done: make(chan struct{}), err: err}
+	close(g.done)
+	return g
 }
 
 type execReq struct {
@@ -33,11 +43,12 @@ type execReq struct {
 }
 
 type Ticket struct {
-	done chan error
+	group *group
 }
 
 func (t Ticket) Wait() error {
-	return <-t.done
+	<-t.group.done
+	return t.group.err
 }
 
 func Open(path string) (*Log, error) {
@@ -63,15 +74,17 @@ func Open(path string) (*Log, error) {
 }
 
 func (l *Log) Enqueue(payload []byte) Ticket {
-	t := Ticket{done: make(chan error, 1)}
 	l.mu.Lock()
 	if l.failed != nil {
 		err := l.failed
 		l.mu.Unlock()
-		t.done <- err
-		return t
+		return Ticket{settled(err)}
 	}
-	l.pending = append(l.pending, request{payload, t.done})
+	if l.group == nil {
+		l.group = &group{done: make(chan struct{})}
+	}
+	t := Ticket{l.group}
+	l.pending = append(l.pending, payload)
 	l.mu.Unlock()
 	select {
 	case l.notify <- struct{}{}:
@@ -125,16 +138,18 @@ func (l *Log) run() {
 func (l *Log) commit() {
 	l.mu.Lock()
 	batch := l.pending
-	l.pending = nil
+	g := l.group
+	l.pending, l.spare = l.spare[:0], l.pending
+	l.group = nil
 	err := l.failed
 	l.mu.Unlock()
-	if len(batch) == 0 {
+	if g == nil {
 		return
 	}
 	if err == nil {
 		l.buf = l.buf[:0]
-		for _, r := range batch {
-			l.buf = append(l.buf, r.payload...)
+		for _, payload := range batch {
+			l.buf = append(l.buf, payload...)
 			l.buf = append(l.buf, '\n')
 		}
 		if _, err = l.f.Write(l.buf); err == nil {
@@ -150,9 +165,9 @@ func (l *Log) commit() {
 			l.mu.Unlock()
 		}
 	}
-	for _, r := range batch {
-		r.done <- err
-	}
+	g.err = err
+	close(g.done)
+	clear(batch)
 }
 
 // Records returns the complete records in the log. A record interrupted by a

@@ -21,6 +21,9 @@ type walRecord struct {
 }
 
 func encode(rec walRecord) ([]byte, error) {
+	if err := rec.valid(); err != nil {
+		return nil, fmt.Errorf("medb: %w", err)
+	}
 	return json.Marshal(rec)
 }
 
@@ -31,7 +34,14 @@ func (rec walRecord) valid() error {
 		return fmt.Errorf("invalid collection name %q", rec.Coll)
 	}
 	switch rec.Op {
-	case opSet, opDel:
+	case opSet:
+		if rec.ID == "" {
+			return fmt.Errorf("%s record with no id", rec.Op)
+		}
+		if len(rec.Doc) == 0 {
+			return fmt.Errorf("%s record with no document", rec.Op)
+		}
+	case opDel:
 		if rec.ID == "" {
 			return fmt.Errorf("%s record with no id", rec.Op)
 		}

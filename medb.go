@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 
@@ -223,20 +222,21 @@ func (db *DB) walPath() string {
 }
 
 func validName(name string) bool {
-	if name == "" {
-		return false
-	}
-	for _, seg := range strings.Split(name, "/") {
-		if seg == "" {
-			return false
-		}
-		for _, r := range seg {
-			if !('a' <= r && r <= 'z' || '0' <= r && r <= '9' || r == '_' || r == '-') {
+	seg := 0
+	for i := range len(name) {
+		switch c := name[i]; {
+		case c == '/':
+			if seg == 0 {
 				return false
 			}
+			seg = 0
+		case 'a' <= c && c <= 'z', '0' <= c && c <= '9', c == '_', c == '-':
+			seg++
+		default:
+			return false
 		}
 	}
-	return true
+	return seg > 0
 }
 
 func mustValidName(name string) {

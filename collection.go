@@ -67,6 +67,9 @@ func (c *Collection[T]) Set(id string, doc T) error {
 }
 
 func (c *Collection[T]) Delete(id string) error {
+	if id == "" {
+		return errEmptyID
+	}
 	db := c.db
 	rec := walRecord{Op: opDel, Coll: c.name, ID: id}
 	payload, err := encode(rec)

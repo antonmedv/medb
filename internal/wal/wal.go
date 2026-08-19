@@ -120,6 +120,9 @@ func (l *Log) Truncate() error {
 	if err := l.f.Truncate(0); err != nil {
 		return err
 	}
+	if err := l.f.Sync(); err != nil {
+		return err
+	}
 	l.size.Store(0)
 	return nil
 }

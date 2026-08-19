@@ -103,11 +103,17 @@ func (db *DB) dropCollection(name string) error {
 	}
 
 	path := db.collPath(name)
-	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	switch err := os.Remove(path); {
+	case errors.Is(err, fs.ErrNotExist):
+		// A collection dropped before its first flush left nothing behind, and
+		// for a namespaced one the parent directory does not exist either, so
+		// there is nothing to sync and nothing to open.
+	case err != nil:
 		return err
-	}
-	if err := fsutil.SyncDir(filepath.Dir(path)); err != nil {
-		return err
+	default:
+		if err := fsutil.SyncDir(filepath.Dir(path)); err != nil {
+			return err
+		}
 	}
 
 	db.mu.Lock()

@@ -214,3 +214,38 @@ func TestExecRunsWhileHealthy(t *testing.T) {
 		t.Fatal("fn did not run on a healthy log")
 	}
 }
+
+func TestTruncateSyncs(t *testing.T) {
+	f := &fakeFile{}
+	l := newLog(f, 0)
+	defer l.Close()
+
+	if err := l.Enqueue([]byte("rec")).Wait(); err != nil {
+		t.Fatal(err)
+	}
+	before := f.syncCount()
+	if err := l.Exec(l.Truncate); err != nil {
+		t.Fatal(err)
+	}
+	if f.syncCount() == before {
+		t.Fatal("Truncate did not sync the new length")
+	}
+}
+
+func TestTruncateSyncFailure(t *testing.T) {
+	want := errors.New("sync failed")
+	f := &fakeFile{}
+	l := newLog(f, 0)
+	defer l.Close()
+
+	if err := l.Enqueue([]byte("rec")).Wait(); err != nil {
+		t.Fatal(err)
+	}
+	f.fail(nil, want)
+	if err := l.Exec(l.Truncate); !errors.Is(err, want) {
+		t.Fatalf("got %v, want %v", err, want)
+	}
+	if l.Size() == 0 {
+		t.Fatal("Size() reset despite a failed sync")
+	}
+}

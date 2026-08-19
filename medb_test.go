@@ -351,10 +351,22 @@ func TestNamespaces(t *testing.T) {
 	}
 }
 
+func TestValidNames(t *testing.T) {
+	db := open(t, t.TempDir())
+	defer db.Close()
+	for _, name := range []string{"a", "0", "-", "_", "users", "user_1", "my-coll", "prod/users", "a/b/c", "a1/b2/c3"} {
+		if err := medb.C[user](db, name).Set("x", user{Name: "X"}); err != nil {
+			t.Errorf("%q: %v", name, err)
+		}
+	}
+}
+
 func TestInvalidNames(t *testing.T) {
 	db := open(t, t.TempDir())
 	defer db.Close()
-	for _, name := range []string{"", "Users", "a b", "a//b", "/a", "a/", "a.b", "../etc", "wal.log"} {
+	names := []string{"", "Users", "a b", "a//b", "/a", "a/", "a.b", "../etc", "wal.log"}
+	names = append(names, "/", "//", "a/b/", "a/B/c", "café", "a\x00b", "a\tb")
+	for _, name := range names {
 		func() {
 			defer func() {
 				if recover() == nil {
@@ -805,5 +817,40 @@ func TestLastWriteDuringFlushSurvives(t *testing.T) {
 	}
 	if !got.Has("late") {
 		t.Error(`document "late" lost: its dirty mark was cleared by a flush that did not capture it`)
+	}
+}
+
+func TestDeleteEmptyID(t *testing.T) {
+	dir := t.TempDir()
+	db := open(t, dir, medb.WithFlushInterval(time.Hour))
+	users := medb.C[user](db, "users")
+	if err := users.Set("a", user{Name: "A"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := users.Delete(""); err == nil {
+		t.Fatal("Delete accepted an empty id")
+	}
+}
+
+// A collection dropped before its first flush has no snapshot file, and if it
+// is namespaced it has no parent directory either: the removal must not try to
+// sync a directory that was never created.
+func TestDropNamespaceBeforeFlush(t *testing.T) {
+	dir := t.TempDir()
+	db := open(t, dir, medb.WithFlushInterval(time.Hour))
+	if err := medb.C[user](db, "prod/users").Set("a", user{Name: "A"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Drop("prod/users"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened := open(t, dir)
+	defer reopened.Close()
+	if got := reopened.Collections(); len(got) != 0 {
+		t.Fatalf("collections after reopen %v, want none", got)
 	}
 }

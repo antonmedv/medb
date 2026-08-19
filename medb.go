@@ -1,0 +1,219 @@
+package medb
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"maps"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/antonmedv/medb/internal/lock"
+	"github.com/antonmedv/medb/internal/wal"
+)
+
+var (
+	ErrNotFound = errors.New("medb: document not found")
+	ErrLocked   = lock.ErrLocked
+	ErrClosed   = errors.New("medb: database is closed")
+	ErrTooLarge = errors.New("medb: document exceeds size limit")
+)
+
+type Option func(*options)
+
+type options struct {
+	maxDocSize    int
+	flushBytes    int64
+	flushInterval time.Duration
+}
+
+func WithMaxDocSize(n int) Option {
+	return func(o *options) { o.maxDocSize = n }
+}
+
+func WithFlushBytes(n int64) Option {
+	return func(o *options) { o.flushBytes = n }
+}
+
+func WithFlushInterval(d time.Duration) Option {
+	return func(o *options) { o.flushInterval = d }
+}
+
+type DB struct {
+	dir  string
+	opts options
+
+	mu      sync.RWMutex
+	colls   map[string]map[string]json.RawMessage
+	dirty   map[string]bool
+	dropped map[string]bool
+	closed  bool
+	failed  error
+
+	log    *wal.Log
+	flock  *os.File
+	flushc chan struct{}
+	stop   chan struct{}
+	done   sync.WaitGroup
+}
+
+func Open(dir string, opts ...Option) (*DB, error) {
+	o := options{
+		maxDocSize:    16 << 20,
+		flushBytes:    64 << 20,
+		flushInterval: 5 * time.Second,
+	}
+	for _, opt := range opts {
+		opt(&o)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	flock, err := lock.Acquire(filepath.Join(dir, "LOCK"))
+	if err != nil {
+		return nil, err
+	}
+	log, err := wal.Open(filepath.Join(dir, "wal.log"))
+	if err != nil {
+		flock.Close()
+		return nil, err
+	}
+	db := &DB{
+		dir:     filepath.Clean(dir),
+		opts:    o,
+		colls:   map[string]map[string]json.RawMessage{},
+		dirty:   map[string]bool{},
+		dropped: map[string]bool{},
+		log:     log,
+		flock:   flock,
+		flushc:  make(chan struct{}, 1),
+		stop:    make(chan struct{}),
+	}
+	if err := db.load(); err != nil {
+		log.Close()
+		flock.Close()
+		return nil, err
+	}
+	db.done.Add(1)
+	go db.run()
+	return db, nil
+}
+
+func (db *DB) Close() error {
+	db.mu.Lock()
+	if db.closed {
+		db.mu.Unlock()
+		return ErrClosed
+	}
+	db.closed = true
+	db.mu.Unlock()
+
+	close(db.stop)
+	db.done.Wait()
+
+	db.mu.Lock()
+	err := db.failed
+	db.mu.Unlock()
+	if e := db.log.Close(); err == nil {
+		err = e
+	}
+	if e := db.flock.Close(); err == nil {
+		err = e
+	}
+	return err
+}
+
+func (db *DB) Collections() []string {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return slices.Sorted(maps.Keys(db.colls))
+}
+
+func (db *DB) Drop(name string) error {
+	mustValidName(name)
+	db.mu.Lock()
+	if err := db.writable(); err != nil {
+		db.mu.Unlock()
+		return err
+	}
+	if _, ok := db.colls[name]; !ok {
+		db.mu.Unlock()
+		return nil
+	}
+	t, err := db.enqueue(walRecord{Op: opDrop, Coll: name})
+	db.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return db.commitWait(t)
+}
+
+func NewID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(err)
+	}
+	return hex.EncodeToString(b[:])
+}
+
+func (db *DB) writable() error {
+	if db.closed {
+		return ErrClosed
+	}
+	return db.failed
+}
+
+func (db *DB) fail(err error) {
+	if err == nil {
+		return
+	}
+	db.mu.Lock()
+	if db.failed == nil {
+		db.failed = err
+	}
+	db.mu.Unlock()
+}
+
+func (db *DB) checkDocSize(raw []byte) error {
+	if len(raw) > db.opts.maxDocSize {
+		return fmt.Errorf("%w: %d bytes, limit %d", ErrTooLarge, len(raw), db.opts.maxDocSize)
+	}
+	return nil
+}
+
+func (db *DB) collPath(name string) string {
+	return filepath.Join(db.dir, filepath.FromSlash(name)+".json")
+}
+
+func (db *DB) walPath() string {
+	return filepath.Join(db.dir, "wal.log")
+}
+
+func validName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, seg := range strings.Split(name, "/") {
+		if seg == "" {
+			return false
+		}
+		for _, r := range seg {
+			if !('a' <= r && r <= 'z' || '0' <= r && r <= '9' || r == '_' || r == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func mustValidName(name string) {
+	if !validName(name) {
+		panic(fmt.Sprintf("medb: invalid collection name %q", name))
+	}
+}

@@ -8,11 +8,11 @@ import (
 	"github.com/antonmedv/medb/internal/wal"
 )
 
-func open(t *testing.T, path string) *wal.Log {
-	t.Helper()
+func open(tb testing.TB, path string) *wal.Log {
+	tb.Helper()
 	l, err := wal.Open(path)
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	return l
 }

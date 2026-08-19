@@ -10,6 +10,7 @@ import (
 type Log struct {
 	f    *os.File
 	size atomic.Int64
+	buf  []byte
 
 	mu      sync.Mutex
 	pending []request
@@ -131,16 +132,16 @@ func (l *Log) commit() {
 		return
 	}
 	if err == nil {
-		var buf []byte
+		l.buf = l.buf[:0]
 		for _, r := range batch {
-			buf = append(buf, r.payload...)
-			buf = append(buf, '\n')
+			l.buf = append(l.buf, r.payload...)
+			l.buf = append(l.buf, '\n')
 		}
-		if _, err = l.f.Write(buf); err == nil {
+		if _, err = l.f.Write(l.buf); err == nil {
 			err = l.f.Sync()
 		}
 		if err == nil {
-			l.size.Add(int64(len(buf)))
+			l.size.Add(int64(len(l.buf)))
 		} else {
 			l.mu.Lock()
 			if l.failed == nil {

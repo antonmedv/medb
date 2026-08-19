@@ -1,9 +1,3 @@
-// Package wal is an append-only log of newline-delimited records, fsynced
-// before a write is acknowledged. A payload must not contain '\n' and must
-// not be modified until its Commit settles. The first failed write, sync, or
-// truncate poisons the log and every later call reports it: a failed fsync
-// cannot be retried, because the kernel may have dropped the dirty pages
-// while marking them clean.
 package wal
 
 import (
@@ -33,7 +27,6 @@ type Log struct {
 	pending [][]byte
 	spare   [][]byte
 	commit  *Commit
-	trunc   *Commit
 
 	notify chan struct{}
 	stop   chan struct{}
@@ -108,18 +101,15 @@ func (l *Log) Drain() error {
 	return c.Wait()
 }
 
-func (l *Log) Truncate() error {
-	l.mu.Lock()
-	if l.trunc == nil {
-		l.trunc = &Commit{done: make(chan struct{})}
+func (l *Log) Reset() error {
+	if err := l.f.Truncate(0); err != nil {
+		return err
 	}
-	c := l.trunc
-	l.mu.Unlock()
-	select {
-	case l.notify <- struct{}{}:
-	default:
+	if err := l.f.Sync(); err != nil {
+		return err
 	}
-	return c.Wait()
+	l.size.Store(0)
+	return nil
 }
 
 func (l *Log) Size() int64 {
@@ -142,7 +132,6 @@ func (l *Log) run() {
 	for {
 		select {
 		case <-l.notify:
-			err = l.truncate(err)
 			err = l.write(err)
 		case <-l.stop:
 			l.failed = l.write(err)
@@ -160,7 +149,7 @@ func (l *Log) write(err error) error {
 	if commit == nil {
 		return err
 	}
-	if err == nil {
+	if err == nil && len(batch) > 0 {
 		l.buf = l.buf[:0]
 		for _, payload := range batch {
 			l.buf = append(l.buf, payload...)
@@ -176,27 +165,6 @@ func (l *Log) write(err error) error {
 	commit.err = err
 	close(commit.done)
 	clear(batch)
-	return err
-}
-
-func (l *Log) truncate(err error) error {
-	l.mu.Lock()
-	commit := l.trunc
-	l.trunc = nil
-	l.mu.Unlock()
-	if commit == nil {
-		return err
-	}
-	if err == nil {
-		if err = l.f.Truncate(0); err == nil {
-			err = l.f.Sync()
-		}
-		if err == nil {
-			l.size.Store(0)
-		}
-	}
-	commit.err = err
-	close(commit.done)
 	return err
 }
 

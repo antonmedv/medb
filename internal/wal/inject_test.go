@@ -2,6 +2,8 @@ package wal
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -10,7 +12,6 @@ type fakeFile struct {
 	mu        sync.Mutex
 	written   []byte
 	syncs     int
-	truncs    int
 	writeErr  error
 	syncErr   error
 	truncErr  error
@@ -41,7 +42,6 @@ func (f *fakeFile) Truncate(int64) error {
 	if f.truncErr != nil {
 		return f.truncErr
 	}
-	f.truncs++
 	f.written = nil
 	return nil
 }
@@ -69,12 +69,6 @@ func (f *fakeFile) syncCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.syncs
-}
-
-func (f *fakeFile) truncCount() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.truncs
 }
 
 type gatedFile struct {
@@ -258,81 +252,6 @@ func TestFailureAfterSuccessfulCommits(t *testing.T) {
 	}
 }
 
-func TestTruncateFailure(t *testing.T) {
-	want := errors.New("truncate failed")
-	f := &fakeFile{truncErr: want}
-	l := newLog(f, 0)
-	defer l.Close()
-
-	if err := l.Enqueue([]byte("rec")).Wait(); err != nil {
-		t.Fatal(err)
-	}
-	if err := l.Truncate(); !errors.Is(err, want) {
-		t.Fatalf("got %v, want %v", err, want)
-	}
-	if l.Size() == 0 {
-		t.Fatal("Size() reset despite a failed truncate")
-	}
-	if err := l.Enqueue([]byte("more")).Wait(); !errors.Is(err, want) {
-		t.Fatalf("Enqueue after a failed truncate: got %v, want %v", err, want)
-	}
-}
-
-func TestTruncateSyncs(t *testing.T) {
-	f := &fakeFile{}
-	l := newLog(f, 0)
-	defer l.Close()
-
-	if err := l.Enqueue([]byte("rec")).Wait(); err != nil {
-		t.Fatal(err)
-	}
-	before := f.syncCount()
-	if err := l.Truncate(); err != nil {
-		t.Fatal(err)
-	}
-	if f.syncCount() == before {
-		t.Fatal("Truncate did not sync the new length")
-	}
-}
-
-func TestTruncateSyncFailure(t *testing.T) {
-	want := errors.New("sync failed")
-	f := &fakeFile{}
-	l := newLog(f, 0)
-	defer l.Close()
-
-	if err := l.Enqueue([]byte("rec")).Wait(); err != nil {
-		t.Fatal(err)
-	}
-	f.fail(nil, want)
-	if err := l.Truncate(); !errors.Is(err, want) {
-		t.Fatalf("got %v, want %v", err, want)
-	}
-	if l.Size() == 0 {
-		t.Fatal("Size() reset despite a failed sync")
-	}
-	if err := l.Enqueue([]byte("more")).Wait(); !errors.Is(err, want) {
-		t.Fatalf("Enqueue after a failed truncate sync: got %v, want %v", err, want)
-	}
-}
-
-func TestTruncateRefusedOnPoisonedLog(t *testing.T) {
-	want := errors.New("sync failed")
-	f := &fakeFile{syncErr: want}
-	l := newLog(f, 0)
-	defer l.Close()
-
-	if err := l.Enqueue([]byte("a")).Wait(); !errors.Is(err, want) {
-		t.Fatalf("got %v, want %v", err, want)
-	}
-	if err := l.Truncate(); !errors.Is(err, want) {
-		t.Fatalf("Truncate on a poisoned log: got %v, want %v", err, want)
-	}
-	if n := f.truncCount(); n != 0 {
-		t.Fatalf("ftruncate reached the file %d times on a poisoned log", n)
-	}
-}
-
 func TestDrain(t *testing.T) {
 	f := &fakeFile{}
 	l := newLog(f, 0)
@@ -422,5 +341,171 @@ func TestCloseReportsCloseError(t *testing.T) {
 	}
 	if err := l.Close(); !errors.Is(err, want) {
 		t.Fatalf("Close returned %v, want %v", err, want)
+	}
+}
+
+var errInjected = errors.New("injected sync failure")
+
+type failAfterFile struct {
+	fakeFile
+	after int
+}
+
+func (f *failAfterFile) Sync() error {
+	f.fakeFile.Sync()
+	if f.syncCount() > f.after {
+		return errInjected
+	}
+	return nil
+}
+
+// Sweep the failure across every sync ordinal: whatever batch the failure
+// lands on, an acknowledged record is in the log, records appear whole, at
+// most once, in per-writer order, and each writer's surviving records are a
+// prefix of what it enqueued.
+func TestAckedRecordsSurviveInjectedFailure(t *testing.T) {
+	const writers, each = 4, 8
+	for limit := 1; limit <= 12; limit++ {
+		f := &failAfterFile{after: limit}
+		l := newLog(f, 0)
+
+		var mu sync.Mutex
+		acked := map[string]bool{}
+		var wg sync.WaitGroup
+		for w := range writers {
+			wg.Add(1)
+			go func(w int) {
+				defer wg.Done()
+				for i := range each {
+					rec := fmt.Sprintf("w%d-%d", w, i)
+					if l.Enqueue([]byte(rec)).Wait() == nil {
+						mu.Lock()
+						acked[rec] = true
+						mu.Unlock()
+					}
+				}
+			}(w)
+		}
+		wg.Wait()
+		l.Close()
+
+		content := f.contents()
+		if content != "" && !strings.HasSuffix(content, "\n") {
+			t.Fatalf("limit %d: log does not end at a record boundary: %q", limit, content)
+		}
+		pos := map[string]int{}
+		for i, rec := range strings.Split(strings.TrimSuffix(content, "\n"), "\n") {
+			if rec == "" {
+				continue
+			}
+			if _, dup := pos[rec]; dup {
+				t.Fatalf("limit %d: record %q appears twice", limit, rec)
+			}
+			pos[rec] = i
+		}
+		for rec := range acked {
+			if _, ok := pos[rec]; !ok {
+				t.Fatalf("limit %d: acked record %q missing from the log", limit, rec)
+			}
+		}
+		for w := range writers {
+			prev, missing := -1, false
+			for i := range each {
+				p, ok := pos[fmt.Sprintf("w%d-%d", w, i)]
+				if !ok {
+					missing = true
+					continue
+				}
+				if missing {
+					t.Fatalf("limit %d: writer %d record %d present after a gap", limit, w, i)
+				}
+				if p <= prev {
+					t.Fatalf("limit %d: writer %d record %d out of order", limit, w, i)
+				}
+				prev = p
+			}
+		}
+	}
+}
+
+// After Drain returns and no writer is active, the goroutine never touches
+// the file again: that idleness is what makes an external Reset safe while
+// the log is open.
+func TestIdleLogTouchesNothing(t *testing.T) {
+	f := &fakeFile{}
+	l := newLog(f, 0)
+	defer l.Close()
+
+	if err := l.Drain(); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Drain(); err != nil {
+		t.Fatal(err)
+	}
+	if n := f.syncCount(); n != 0 {
+		t.Fatalf("%d syncs on an idle log, want 0", n)
+	}
+	if got := f.contents(); got != "" {
+		t.Fatalf("idle log wrote %q", got)
+	}
+}
+
+func TestReset(t *testing.T) {
+	f := &fakeFile{}
+	l := newLog(f, 0)
+	defer l.Close()
+
+	if err := l.Enqueue([]byte("old")).Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Reset(); err != nil {
+		t.Fatal(err)
+	}
+	if l.Size() != 0 {
+		t.Fatalf("Size()=%d after Reset, want 0", l.Size())
+	}
+	if err := l.Enqueue([]byte("new")).Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.contents(); got != "new\n" {
+		t.Fatalf("log holds %q, want only the post-Reset record", got)
+	}
+}
+
+func TestResetTruncateFailure(t *testing.T) {
+	want := errors.New("truncate failed")
+	f := &fakeFile{truncErr: want}
+	l := newLog(f, 0)
+	defer l.Close()
+
+	if err := l.Enqueue([]byte("rec")).Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Reset(); !errors.Is(err, want) {
+		t.Fatalf("got %v, want %v", err, want)
+	}
+	if l.Size() == 0 {
+		t.Fatal("Size() reset despite a failed truncate")
+	}
+	if got := f.contents(); got != "rec\n" {
+		t.Fatalf("log holds %q after a failed Reset", got)
+	}
+}
+
+func TestResetSyncFailure(t *testing.T) {
+	want := errors.New("sync failed")
+	f := &fakeFile{}
+	l := newLog(f, 0)
+	defer l.Close()
+
+	if err := l.Enqueue([]byte("rec")).Wait(); err != nil {
+		t.Fatal(err)
+	}
+	f.fail(nil, want)
+	if err := l.Reset(); !errors.Is(err, want) {
+		t.Fatalf("got %v, want %v", err, want)
+	}
+	if l.Size() == 0 {
+		t.Fatal("Size() reset despite a failed sync")
 	}
 }

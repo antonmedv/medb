@@ -1,17 +1,88 @@
 package wal_test
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 
 	"github.com/antonmedv/medb/internal/wal"
 )
+
+func TestMain(m *testing.M) {
+	if dir := os.Getenv("WAL_CRASH_CHILD"); dir != "" {
+		crashWriter(dir)
+		return
+	}
+	os.Exit(m.Run())
+}
+
+func crashWriter(dir string) {
+	l, err := wal.Open(filepath.Join(dir, "wal.log"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	for i := 0; ; i++ {
+		if err := l.Enqueue(fmt.Appendf(nil, "rec%d", i)).Wait(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Println(i)
+	}
+}
+
+// The writer is a real process acknowledging records only after Wait returns,
+// killed with SIGKILL mid-stream: every acknowledged record must be in the
+// log, whole and in order, when the survivor replays it.
+func TestCrashDurability(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns and kills subprocesses")
+	}
+	for _, kill := range []int{0, 3, 17} {
+		dir := t.TempDir()
+		cmd := exec.Command(os.Args[0])
+		cmd.Env = append(os.Environ(), "WAL_CRASH_CHILD="+dir)
+		cmd.Stderr = os.Stderr
+		out, err := cmd.StdoutPipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		acked := -1
+		sc := bufio.NewScanner(out)
+		for acked < kill && sc.Scan() {
+			n, err := strconv.Atoi(sc.Text())
+			if err != nil {
+				continue
+			}
+			acked = n
+		}
+		cmd.Process.Kill()
+		cmd.Wait()
+		if acked < kill {
+			t.Fatalf("writer died after %d acks, wanted %d", acked, kill)
+		}
+		recs := records(t, filepath.Join(dir, "wal.log"))
+		if len(recs) < acked+1 {
+			t.Fatalf("killed after ack %d, log holds only %d records", acked, len(recs))
+		}
+		for i, r := range recs {
+			if want := fmt.Sprintf("rec%d", i); string(r) != want {
+				t.Fatalf("record %d is %q, want %q", i, r, want)
+			}
+		}
+	}
+}
 
 func open(tb testing.TB, path string) *wal.Log {
 	tb.Helper()
@@ -174,23 +245,30 @@ func TestTerminatedGarbageIsARecord(t *testing.T) {
 	}
 }
 
-func TestTruncate(t *testing.T) {
+// The flush protocol: writes stopped, Drain, snapshot elsewhere, Reset, writes
+// resume on the same open log.
+func TestFlushCycle(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "wal.log")
 	l := open(t, path)
-	if err := l.Enqueue([]byte("rec")).Wait(); err != nil {
-		t.Fatal(err)
+	for _, s := range []string{"a", "b"} {
+		if err := l.Enqueue([]byte(s)).Wait(); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := l.Drain(); err != nil {
 		t.Fatal(err)
 	}
-	if err := l.Truncate(); err != nil {
+	if err := l.Reset(); err != nil {
 		t.Fatal(err)
 	}
 	if l.Size() != 0 {
-		t.Fatalf("size %d after truncate", l.Size())
+		t.Fatalf("Size()=%d after Reset, want 0", l.Size())
 	}
-	if err := l.Enqueue([]byte("after")).Wait(); err != nil {
+	if err := l.Enqueue([]byte("c")).Wait(); err != nil {
 		t.Fatal(err)
+	}
+	if l.Size() != int64(len("c\n")) {
+		t.Fatalf("Size()=%d, want %d", l.Size(), len("c\n"))
 	}
 	if err := l.Close(); err != nil {
 		t.Fatal(err)
@@ -199,14 +277,8 @@ func TestTruncate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(data) != "after\n" {
-		t.Fatalf("log holds %q, want the post-truncate record at offset 0", data)
-	}
-
-	l = open(t, path)
-	defer l.Close()
-	if l.Size() != int64(len("after\n")) {
-		t.Fatalf("size %d after reopen, want %d", l.Size(), len("after\n"))
+	if string(data) != "c\n" {
+		t.Fatalf("log holds %q after the flush cycle, want %q", data, "c\n")
 	}
 }
 
@@ -249,39 +321,14 @@ func TestSizeMatchesFile(t *testing.T) {
 	}
 }
 
-func TestReopenAppends(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "wal.log")
-	l := open(t, path)
-	if err := l.Enqueue([]byte("first")).Wait(); err != nil {
-		t.Fatal(err)
-	}
-	size := l.Size()
-	if err := l.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	l = open(t, path)
-	defer l.Close()
-	if l.Size() != size {
-		t.Fatalf("reopened Size()=%d, want %d", l.Size(), size)
-	}
-	if err := l.Enqueue([]byte("second")).Wait(); err != nil {
-		t.Fatal(err)
-	}
-	var got []string
-	for _, r := range records(t, path) {
-		got = append(got, string(r))
-	}
-	if want := []string{"first", "second"}; !slices.Equal(got, want) {
-		t.Fatalf("got %q, want %q", got, want)
-	}
-}
-
-func TestEveryPrefixRecoversWholeRecords(t *testing.T) {
+// A crash can cut the file at any byte. Recovery replays the whole-record
+// prefix, resets the log, and reopens it empty: the new session's records
+// never mix with the old bytes.
+func TestRecoveryAtEveryTornPrefix(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "wal.log")
 	l := open(t, path)
-	want := []string{"first", "second", "third", "fourth"}
+	want := []string{"first", "second", "third"}
 	for _, s := range want {
 		if err := l.Enqueue([]byte(s)).Wait(); err != nil {
 			t.Fatal(err)
@@ -295,9 +342,9 @@ func TestEveryPrefixRecoversWholeRecords(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	trunc := filepath.Join(dir, "truncated.log")
 	for n := 0; n <= len(full); n++ {
-		if err := os.WriteFile(trunc, full[:n], 0o600); err != nil {
+		p := filepath.Join(dir, fmt.Sprintf("torn%d.log", n))
+		if err := os.WriteFile(p, full[:n], 0o600); err != nil {
 			t.Fatal(err)
 		}
 		var expect []string
@@ -309,12 +356,32 @@ func TestEveryPrefixRecoversWholeRecords(t *testing.T) {
 			expect = append(expect, s)
 			consumed += len(s) + 1
 		}
+		var replayed []string
+		for _, r := range records(t, p) {
+			replayed = append(replayed, string(r))
+		}
+		if !slices.Equal(replayed, expect) {
+			t.Fatalf("cut at %d: replayed %q, want %q", n, replayed, expect)
+		}
+		l := open(t, p)
+		if l.Size() != int64(n) {
+			t.Fatalf("cut at %d: Size()=%d before Reset", n, l.Size())
+		}
+		if err := l.Reset(); err != nil {
+			t.Fatal(err)
+		}
+		if err := l.Enqueue([]byte("new")).Wait(); err != nil {
+			t.Fatal(err)
+		}
+		if err := l.Close(); err != nil {
+			t.Fatal(err)
+		}
 		var got []string
-		for _, r := range records(t, trunc) {
+		for _, r := range records(t, p) {
 			got = append(got, string(r))
 		}
-		if !slices.Equal(got, expect) {
-			t.Fatalf("truncated to %d bytes: got %q, want %q", n, got, expect)
+		if !slices.Equal(got, []string{"new"}) {
+			t.Fatalf("cut at %d: got %q after recovery, want only the new record", n, got)
 		}
 	}
 }

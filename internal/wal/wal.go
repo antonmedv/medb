@@ -7,8 +7,15 @@ import (
 	"sync/atomic"
 )
 
+type file interface {
+	Write(p []byte) (int, error)
+	Sync() error
+	Truncate(size int64) error
+	Close() error
+}
+
 type Log struct {
-	f    *os.File
+	f    file
 	size atomic.Int64
 	buf  []byte
 
@@ -61,16 +68,20 @@ func Open(path string) (*Log, error) {
 		f.Close()
 		return nil, err
 	}
+	return newLog(f, info.Size()), nil
+}
+
+func newLog(f file, size int64) *Log {
 	l := &Log{
 		f:      f,
 		notify: make(chan struct{}, 1),
 		exec:   make(chan execReq),
 		stop:   make(chan struct{}),
 	}
-	l.size.Store(info.Size())
+	l.size.Store(size)
 	l.done.Add(1)
 	go l.run()
-	return l, nil
+	return l
 }
 
 func (l *Log) Enqueue(payload []byte) Ticket {

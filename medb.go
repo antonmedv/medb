@@ -142,6 +142,15 @@ func (db *DB) Close() error {
 	if e := db.flock.Close(); err == nil {
 		err = e
 	}
+
+	// Only after the flusher and the log are stopped: the final flush reads
+	// these maps, and clearing them any earlier would snapshot an empty
+	// database over the real one.
+	db.mu.Lock()
+	clear(db.colls)
+	clear(db.dirty)
+	clear(db.dropped)
+	db.mu.Unlock()
 	return err
 }
 

@@ -665,6 +665,32 @@ func TestClosedReadsAreEmpty(t *testing.T) {
 	}
 }
 
+// Close drops the in-memory copy, so the durable copy is all that is left:
+// clearing must never race the final flush.
+func TestClosePreservesDataOnDisk(t *testing.T) {
+	dir := t.TempDir()
+	db := open(t, dir, medb.WithFlushInterval(time.Hour))
+	seed(t, medb.C[user](db, "users"), 50)
+	if err := medb.C[user](db, "prod/orders").Set("o1", user{Name: "O"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if n := medb.C[user](db, "users").Count(); n != 0 {
+		t.Errorf("closed database still holds %d documents in memory", n)
+	}
+
+	reopened := open(t, dir)
+	defer reopened.Close()
+	if n := medb.C[user](reopened, "users").Count(); n != 50 {
+		t.Fatalf("reopened with %d documents, want 50", n)
+	}
+	if _, err := medb.C[user](reopened, "prod/orders").Get("o1"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestInvalidOptions(t *testing.T) {
 	for _, tc := range []struct {
 		name string

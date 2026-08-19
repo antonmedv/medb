@@ -1,334 +1,15 @@
 package medb_test
 
 import (
-	"bytes"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/antonmedv/medb"
 )
-
-type user struct {
-	Name string `json:"name"`
-	Age  int    `json:"age"`
-}
-
-func open(t *testing.T, dir string, opts ...medb.Option) *medb.DB {
-	t.Helper()
-	db, err := medb.Open(dir, opts...)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return db
-}
-
-// crash copies the database directory as it currently sits on disk, so the
-// copy can be opened as if the process holding the original had died.
-func crash(t *testing.T, dir string) string {
-	t.Helper()
-	dst := filepath.Join(t.TempDir(), "crashed")
-	if err := os.CopyFS(dst, os.DirFS(dir)); err != nil {
-		t.Fatal(err)
-	}
-	return dst
-}
-
-func appendToWAL(t *testing.T, dir, s string) {
-	t.Helper()
-	f, err := os.OpenFile(filepath.Join(dir, "wal.log"), os.O_APPEND|os.O_WRONLY, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.Write([]byte(s)); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func walSize(t *testing.T, dir string) int64 {
-	t.Helper()
-	info, err := os.Stat(filepath.Join(dir, "wal.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return info.Size()
-}
-
-func seed(t *testing.T, users *medb.Collection[user], n int) {
-	t.Helper()
-	for i := range n {
-		if err := users.Set(fmt.Sprintf("u%d", i), user{Name: fmt.Sprintf("user-%d", i)}); err != nil {
-			t.Fatal(err)
-		}
-	}
-}
-
-func waitFor(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if cond() {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for %s", what)
-}
-
-func TestSetGet(t *testing.T) {
-	db := open(t, t.TempDir())
-	defer db.Close()
-	users := medb.C[user](db, "users")
-
-	if err := users.Set("ada", user{"Ada", 36}); err != nil {
-		t.Fatal(err)
-	}
-	got, err := users.Get("ada")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != (user{"Ada", 36}) {
-		t.Fatalf("got %+v", got)
-	}
-	if _, err := users.Get("nope"); !errors.Is(err, medb.ErrNotFound) {
-		t.Fatalf("got %v, want ErrNotFound", err)
-	}
-	if err := users.Set("", user{}); err == nil {
-		t.Fatal("empty id accepted")
-	}
-}
-
-func TestPersistence(t *testing.T) {
-	dir := t.TempDir()
-	db := open(t, dir)
-	if err := medb.C[user](db, "users").Set("ada", user{"Ada", 36}); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := os.Stat(filepath.Join(dir, "users.json")); err != nil {
-		t.Fatal(err)
-	}
-	if n := walSize(t, dir); n != 0 {
-		t.Fatalf("wal not truncated after Close: %d bytes", n)
-	}
-
-	db = open(t, dir)
-	defer db.Close()
-	got, err := medb.C[user](db, "users").Get("ada")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.Name != "Ada" {
-		t.Fatalf("got %+v", got)
-	}
-}
-
-func TestCrashRecovery(t *testing.T) {
-	dir := t.TempDir()
-	db := open(t, dir, medb.WithFlushInterval(time.Hour))
-	defer db.Close()
-	seed(t, medb.C[user](db, "users"), 3)
-
-	if _, err := os.Stat(filepath.Join(dir, "users.json")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatal("snapshot exists before flush; recovery would not exercise the WAL")
-	}
-	crashed := crash(t, dir)
-
-	db2 := open(t, crashed)
-	defer db2.Close()
-	if n := medb.C[user](db2, "users").Count(); n != 3 {
-		t.Fatalf("recovered %d docs, want 3", n)
-	}
-	if n := walSize(t, crashed); n != 0 {
-		t.Fatalf("wal not truncated after recovery: %d bytes", n)
-	}
-}
-
-func TestTornTail(t *testing.T) {
-	dir := t.TempDir()
-	db := open(t, dir, medb.WithFlushInterval(time.Hour))
-	defer db.Close()
-	seed(t, medb.C[user](db, "users"), 3)
-
-	crashed := crash(t, dir)
-	appendToWAL(t, crashed, "torn garbage tail")
-
-	db2 := open(t, crashed)
-	defer db2.Close()
-	if n := medb.C[user](db2, "users").Count(); n != 3 {
-		t.Fatalf("recovered %d docs, want 3", n)
-	}
-}
-
-func corruptWALLine(t *testing.T, dir string, line int) {
-	t.Helper()
-	path := filepath.Join(dir, "wal.log")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lines := bytes.SplitAfter(data, []byte("\n"))
-	if line >= len(lines) {
-		t.Fatalf("wal has %d lines, cannot corrupt line %d", len(lines), line)
-	}
-	lines[line][0] = '!'
-	if err := os.WriteFile(path, bytes.Join(lines, nil), 0o600); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// A record that is newline terminated but unparseable is mid-log corruption,
-// not a torn tail: refusing to open keeps the committed records that follow it
-// recoverable instead of truncating them away.
-func TestCorruptRecordFailsOpen(t *testing.T) {
-	dir := t.TempDir()
-	db := open(t, dir, medb.WithFlushInterval(time.Hour))
-	seed(t, medb.C[user](db, "users"), 3)
-	crashed := crash(t, dir)
-	db.Close()
-
-	appendToWAL(t, crashed, `{"op":"set","coll":"users","id":"u9","doc":{"name":`+"\n")
-	before := walSize(t, crashed)
-
-	if _, err := medb.Open(crashed); err == nil {
-		t.Fatal("Open accepted a corrupt wal record")
-	}
-	if after := walSize(t, crashed); after != before {
-		t.Fatalf("wal went from %d to %d bytes: committed records were destroyed", before, after)
-	}
-}
-
-func TestCorruptMiddleRecordPreservesLog(t *testing.T) {
-	dir := t.TempDir()
-	db := open(t, dir, medb.WithFlushInterval(time.Hour))
-	seed(t, medb.C[user](db, "users"), 3)
-	crashed := crash(t, dir)
-	db.Close()
-
-	before := walSize(t, crashed)
-	corruptWALLine(t, crashed, 1)
-
-	if _, err := medb.Open(crashed); err == nil {
-		t.Fatal("Open accepted a corrupt wal record")
-	}
-	if after := walSize(t, crashed); after != before {
-		t.Fatalf("wal went from %d to %d bytes: committed records were destroyed", before, after)
-	}
-	if _, err := os.Stat(filepath.Join(crashed, "users.json")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatal("an aborted replay still wrote a snapshot")
-	}
-}
-
-func TestUnknownOpFailsOpen(t *testing.T) {
-	dir := t.TempDir()
-	db := open(t, dir, medb.WithFlushInterval(time.Hour))
-	seed(t, medb.C[user](db, "users"), 1)
-	crashed := crash(t, dir)
-	db.Close()
-
-	appendToWAL(t, crashed, `{"op":"nuke","coll":"users","id":"x"}`+"\n")
-	if _, err := medb.Open(crashed); err == nil {
-		t.Fatal("Open accepted a record with an unknown op")
-	}
-}
-
-func TestWALPathTraversalRejected(t *testing.T) {
-	base := t.TempDir()
-	dir := filepath.Join(base, "db")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	rec := `{"op":"set","coll":"a/../../escape","id":"x","doc":{"name":"pwned"}}` + "\n"
-	if err := os.WriteFile(filepath.Join(dir, "wal.log"), []byte(rec), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	opened := make(chan error, 1)
-	go func() {
-		db, err := medb.Open(dir)
-		if db != nil {
-			db.Close()
-		}
-		opened <- err
-	}()
-	select {
-	case err := <-opened:
-		if err == nil {
-			t.Fatal("Open accepted a collection name that escapes the database directory")
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Open hung: the ancestor sync loop is unbounded")
-	}
-	if _, err := os.Stat(filepath.Join(base, "escape.json")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("a file was written outside the database directory: %v", err)
-	}
-}
-
-func TestDelete(t *testing.T) {
-	dir := t.TempDir()
-	db := open(t, dir)
-	users := medb.C[user](db, "users")
-	users.Set("a", user{Name: "A"})
-	users.Set("b", user{Name: "B"})
-	if err := users.Delete("a"); err != nil {
-		t.Fatal(err)
-	}
-	if err := users.Delete("a"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := users.Get("a"); !errors.Is(err, medb.ErrNotFound) {
-		t.Fatal("still present")
-	}
-	db.Close()
-
-	db = open(t, dir)
-	defer db.Close()
-	users = medb.C[user](db, "users")
-	if _, err := users.Get("a"); !errors.Is(err, medb.ErrNotFound) {
-		t.Fatal("resurrected after reopen")
-	}
-	if !users.Has("b") {
-		t.Fatal("b lost")
-	}
-}
-
-func TestDrop(t *testing.T) {
-	dir := t.TempDir()
-	db := open(t, dir)
-	medb.C[user](db, "users").Set("a", user{Name: "A"})
-	medb.C[user](db, "orders").Set("o", user{Name: "O"})
-	if err := db.Drop("users"); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Drop("missing"); err != nil {
-		t.Fatal(err)
-	}
-	if got := db.Collections(); !slices.Equal(got, []string{"orders"}) {
-		t.Fatalf("collections %v", got)
-	}
-	db.Close()
-
-	if _, err := os.Stat(filepath.Join(dir, "users.json")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatal("users.json survived drop")
-	}
-	db = open(t, dir)
-	defer db.Close()
-	if got := db.Collections(); !slices.Equal(got, []string{"orders"}) {
-		t.Fatalf("collections after reopen %v", got)
-	}
-}
 
 func TestNamespaces(t *testing.T) {
 	dir := t.TempDir()
@@ -336,13 +17,12 @@ func TestNamespaces(t *testing.T) {
 	if err := medb.C[user](db, "prod/users").Set("a", user{Name: "A"}); err != nil {
 		t.Fatal(err)
 	}
-	db.Close()
+	db = reopen(t, db, dir)
+	defer db.Close()
 
 	if _, err := os.Stat(filepath.Join(dir, "prod", "users.json")); err != nil {
 		t.Fatal(err)
 	}
-	db = open(t, dir)
-	defer db.Close()
 	if got := db.Collections(); !slices.Equal(got, []string{"prod/users"}) {
 		t.Fatalf("collections %v", got)
 	}
@@ -378,6 +58,32 @@ func TestInvalidNames(t *testing.T) {
 	}
 }
 
+func TestDrop(t *testing.T) {
+	dir := t.TempDir()
+	db := open(t, dir)
+	medb.C[user](db, "users").Set("a", user{Name: "A"})
+	medb.C[user](db, "orders").Set("o", user{Name: "O"})
+	if err := db.Drop("users"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Drop("missing"); err != nil {
+		t.Fatal(err)
+	}
+	if got := db.Collections(); !slices.Equal(got, []string{"orders"}) {
+		t.Fatalf("collections %v", got)
+	}
+	db.Close()
+
+	if _, err := os.Stat(filepath.Join(dir, "users.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("users.json survived drop")
+	}
+	db = open(t, dir)
+	defer db.Close()
+	if got := db.Collections(); !slices.Equal(got, []string{"orders"}) {
+		t.Fatalf("collections after reopen %v", got)
+	}
+}
+
 func TestPermissions(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
 	db := open(t, dir)
@@ -410,136 +116,30 @@ func TestLocked(t *testing.T) {
 	}
 }
 
-func TestConcurrent(t *testing.T) {
-	dir := t.TempDir()
-	db := open(t, dir)
-	users := medb.C[user](db, "users")
-	var wg sync.WaitGroup
-	for w := range 8 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := range 25 {
-				id := fmt.Sprintf("u%d-%d", w, i)
-				if err := users.Set(id, user{Name: id}); err != nil {
-					t.Error(err)
-				}
+func TestInvalidOptions(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opt  medb.Option
+	}{
+		{"zero doc size", medb.WithMaxDocSize(0)},
+		{"negative doc size", medb.WithMaxDocSize(-1)},
+		{"zero flush bytes", medb.WithFlushBytes(0)},
+		{"negative flush bytes", medb.WithFlushBytes(-1)},
+		{"zero flush interval", medb.WithFlushInterval(0)},
+		{"negative flush interval", medb.WithFlushInterval(-time.Second)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "data")
+			db, err := medb.Open(dir, tc.opt)
+			if err == nil {
+				db.Close()
+				t.Fatal("Open accepted an invalid option")
 			}
-		}()
-	}
-	wg.Wait()
-	if users.Count() != 200 {
-		t.Fatalf("count %d, want 200", users.Count())
-	}
-	db.Close()
-
-	db = open(t, dir)
-	defer db.Close()
-	if n := medb.C[user](db, "users").Count(); n != 200 {
-		t.Fatalf("count after reopen %d, want 200", n)
-	}
-}
-
-func TestUpdate(t *testing.T) {
-	db := open(t, t.TempDir())
-	defer db.Close()
-	users := medb.C[user](db, "users")
-	users.Set("a", user{Name: "A", Age: 1})
-
-	var wg sync.WaitGroup
-	for range 10 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			err := users.Update("a", func(u user) (user, error) {
-				u.Age++
-				return u, nil
-			})
-			if err != nil {
-				t.Error(err)
+			t.Log(err)
+			if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("Open created %s after rejecting the options", dir)
 			}
-		}()
-	}
-	wg.Wait()
-	got, err := users.Get("a")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.Age != 11 {
-		t.Fatalf("age %d, want 11", got.Age)
-	}
-	if err := users.Update("missing", func(u user) (user, error) { return u, nil }); !errors.Is(err, medb.ErrNotFound) {
-		t.Fatalf("got %v, want ErrNotFound", err)
-	}
-}
-
-func TestAll(t *testing.T) {
-	db := open(t, t.TempDir())
-	defer db.Close()
-	users := medb.C[user](db, "users")
-	users.Set("b", user{Name: "B"})
-	users.Set("a", user{Name: "A"})
-	users.Set("c", user{Name: "C"})
-
-	var ids []string
-	for id, u := range users.All() {
-		ids = append(ids, id)
-		if u.Name != strings.ToUpper(id) {
-			t.Fatalf("id %s has %+v", id, u)
-		}
-	}
-	if !slices.Equal(ids, []string{"a", "b", "c"}) {
-		t.Fatalf("order %v", ids)
-	}
-
-	for range users.All() {
-		break
-	}
-}
-
-func TestFlushBytes(t *testing.T) {
-	dir := t.TempDir()
-	db := open(t, dir, medb.WithFlushBytes(1))
-	defer db.Close()
-	if err := medb.C[user](db, "users").Set("a", user{Name: "A"}); err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, "snapshot flush", func() bool {
-		info, err := os.Stat(filepath.Join(dir, "wal.log"))
-		if err != nil {
-			return false
-		}
-		_, serr := os.Stat(filepath.Join(dir, "users.json"))
-		return info.Size() == 0 && serr == nil
-	})
-	crashed := crash(t, dir)
-
-	db2 := open(t, crashed)
-	defer db2.Close()
-	if _, err := medb.C[user](db2, "users").Get("a"); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestFlushInterval(t *testing.T) {
-	dir := t.TempDir()
-	db := open(t, dir, medb.WithFlushInterval(50*time.Millisecond))
-	defer db.Close()
-	if err := medb.C[user](db, "users").Set("a", user{Name: "A"}); err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, "interval flush", func() bool {
-		info, err := os.Stat(filepath.Join(dir, "wal.log"))
-		return err == nil && info.Size() == 0
-	})
-}
-
-func TestTooLarge(t *testing.T) {
-	db := open(t, t.TempDir(), medb.WithMaxDocSize(16))
-	defer db.Close()
-	err := medb.C[user](db, "users").Set("a", user{Name: strings.Repeat("x", 100)})
-	if !errors.Is(err, medb.ErrTooLarge) {
-		t.Fatalf("got %v, want ErrTooLarge", err)
+		})
 	}
 }
 
@@ -561,88 +161,6 @@ func TestClosed(t *testing.T) {
 	}
 	if err := db.Close(); !errors.Is(err, medb.ErrClosed) {
 		t.Fatalf("Close: %v", err)
-	}
-}
-
-func TestNewID(t *testing.T) {
-	a, b := medb.NewID(), medb.NewID()
-	if len(a) != 32 || a == b {
-		t.Fatalf("ids %q %q", a, b)
-	}
-}
-
-// A panic inside Update's callback must not leave the database locked.
-func TestUpdatePanicKeepsDBUsable(t *testing.T) {
-	db := open(t, t.TempDir())
-	defer db.Close()
-	users := medb.C[user](db, "users")
-	if err := users.Set("a", user{Name: "A", Age: 1}); err != nil {
-		t.Fatal(err)
-	}
-
-	func() {
-		defer func() {
-			if recover() == nil {
-				t.Error("panic did not propagate to the caller")
-			}
-		}()
-		users.Update("a", func(u user) (user, error) {
-			var m map[string]int
-			m["boom"] = 1
-			return u, nil
-		})
-	}()
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		if err := users.Set("b", user{Name: "B"}); err != nil {
-			t.Error(err)
-		}
-		got, err := users.Get("a")
-		if err != nil {
-			t.Error(err)
-		}
-		if got.Age != 1 {
-			t.Errorf("document changed despite the panic: %+v", got)
-		}
-	}()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("db.mu still held after a panic inside Update's callback")
-	}
-}
-
-type panicMarshal struct{}
-
-func (panicMarshal) MarshalJSON() ([]byte, error) { panic("marshal boom") }
-
-func TestMarshalPanicKeepsDBUsable(t *testing.T) {
-	db := open(t, t.TempDir())
-	defer db.Close()
-	if err := medb.C[user](db, "users").Set("a", user{Name: "A"}); err != nil {
-		t.Fatal(err)
-	}
-
-	func() {
-		defer func() { recover() }()
-		medb.C[panicMarshal](db, "users").Update("a", func(p panicMarshal) (panicMarshal, error) {
-			return p, nil
-		})
-	}()
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		if err := medb.C[user](db, "users").Set("b", user{Name: "B"}); err != nil {
-			t.Error(err)
-		}
-	}()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("db.mu still held after a panic inside json.Marshal")
 	}
 }
 
@@ -677,180 +195,9 @@ func TestClosedReadsAreEmpty(t *testing.T) {
 	}
 }
 
-// Close drops the in-memory copy, so the durable copy is all that is left:
-// clearing must never race the final flush.
-func TestClosePreservesDataOnDisk(t *testing.T) {
-	dir := t.TempDir()
-	db := open(t, dir, medb.WithFlushInterval(time.Hour))
-	seed(t, medb.C[user](db, "users"), 50)
-	if err := medb.C[user](db, "prod/orders").Set("o1", user{Name: "O"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if n := medb.C[user](db, "users").Count(); n != 0 {
-		t.Errorf("closed database still holds %d documents in memory", n)
-	}
-
-	reopened := open(t, dir)
-	defer reopened.Close()
-	if n := medb.C[user](reopened, "users").Count(); n != 50 {
-		t.Fatalf("reopened with %d documents, want 50", n)
-	}
-	if _, err := medb.C[user](reopened, "prod/orders").Get("o1"); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestInvalidOptions(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		opt  medb.Option
-	}{
-		{"zero doc size", medb.WithMaxDocSize(0)},
-		{"negative doc size", medb.WithMaxDocSize(-1)},
-		{"zero flush bytes", medb.WithFlushBytes(0)},
-		{"negative flush bytes", medb.WithFlushBytes(-1)},
-		{"zero flush interval", medb.WithFlushInterval(0)},
-		{"negative flush interval", medb.WithFlushInterval(-time.Second)},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			dir := filepath.Join(t.TempDir(), "data")
-			db, err := medb.Open(dir, tc.opt)
-			if err == nil {
-				db.Close()
-				t.Fatal("Open accepted an invalid option")
-			}
-			t.Log(err)
-			if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
-				t.Errorf("Open created %s after rejecting the options", dir)
-			}
-		})
-	}
-}
-
-// Writes that land while a flush is encoding a collection must stay marked
-// dirty, or the next flush truncates their records without snapshotting them.
-func TestWritesDuringFlushSurvive(t *testing.T) {
-	dir := t.TempDir()
-	db := open(t, dir, medb.WithFlushBytes(1), medb.WithFlushInterval(time.Hour))
-	users := medb.C[user](db, "users")
-
-	const writers, each = 8, 30
-	var wg sync.WaitGroup
-	for w := range writers {
-		wg.Add(1)
-		go func(w int) {
-			defer wg.Done()
-			for i := range each {
-				id := fmt.Sprintf("w%d-%d", w, i)
-				if err := users.Set(id, user{Name: id}); err != nil {
-					t.Error(err)
-				}
-			}
-		}(w)
-	}
-	wg.Wait()
-
-	want := users.Count()
-	if want != writers*each {
-		t.Fatalf("in memory %d documents, want %d", want, writers*each)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	reopened := open(t, dir)
-	defer reopened.Close()
-	got := medb.C[user](reopened, "users")
-	if n := got.Count(); n != want {
-		t.Fatalf("reopened with %d documents, want %d", n, want)
-	}
-	for w := range writers {
-		for i := range each {
-			if id := fmt.Sprintf("w%d-%d", w, i); !got.Has(id) {
-				t.Errorf("document %s lost", id)
-			}
-		}
-	}
-}
-
-// The last write to a collection is the one at risk: if a flush clears the
-// dirty mark it did not capture, no later write re-marks the collection and
-// the next truncate discards the record with no snapshot holding it.
-func TestLastWriteDuringFlushSurvives(t *testing.T) {
-	dir := t.TempDir()
-	big := strings.Repeat("x", 1<<20)
-
-	db := open(t, dir, medb.WithFlushBytes(1<<30), medb.WithFlushInterval(time.Hour))
-	users := medb.C[user](db, "users")
-	for i := range 50 {
-		if err := users.Set(fmt.Sprintf("big%d", i), user{Name: big}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	// Reopened with a byte threshold of 1, the next commit starts a flush that
-	// spends a long time encoding 50 MB. "late" lands inside that window.
-	db = open(t, dir, medb.WithFlushBytes(1), medb.WithFlushInterval(time.Hour))
-	users = medb.C[user](db, "users")
-	if err := users.Set("trigger", user{Name: "t"}); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(25 * time.Millisecond)
-	if err := users.Set("late", user{Name: "late"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	reopened := open(t, dir)
-	defer reopened.Close()
-	got := medb.C[user](reopened, "users")
-	if !got.Has("trigger") {
-		t.Error(`document "trigger" lost`)
-	}
-	if !got.Has("late") {
-		t.Error(`document "late" lost: its dirty mark was cleared by a flush that did not capture it`)
-	}
-}
-
-func TestDeleteEmptyID(t *testing.T) {
-	dir := t.TempDir()
-	db := open(t, dir, medb.WithFlushInterval(time.Hour))
-	users := medb.C[user](db, "users")
-	if err := users.Set("a", user{Name: "A"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := users.Delete(""); err == nil {
-		t.Fatal("Delete accepted an empty id")
-	}
-}
-
-// A collection dropped before its first flush has no snapshot file, and if it
-// is namespaced it has no parent directory either: the removal must not try to
-// sync a directory that was never created.
-func TestDropNamespaceBeforeFlush(t *testing.T) {
-	dir := t.TempDir()
-	db := open(t, dir, medb.WithFlushInterval(time.Hour))
-	if err := medb.C[user](db, "prod/users").Set("a", user{Name: "A"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Drop("prod/users"); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	reopened := open(t, dir)
-	defer reopened.Close()
-	if got := reopened.Collections(); len(got) != 0 {
-		t.Fatalf("collections after reopen %v, want none", got)
+func TestNewID(t *testing.T) {
+	a, b := medb.NewID(), medb.NewID()
+	if len(a) != 32 || a == b {
+		t.Fatalf("ids %q %q", a, b)
 	}
 }

@@ -68,9 +68,8 @@ type DB struct {
 
 	mu      sync.RWMutex
 	colls   map[string]map[string]json.RawMessage
-	dirty   map[string]uint64
+	dirty   map[string]bool
 	dropped map[string]bool
-	seq     uint64
 	closed  bool
 	failed  error
 
@@ -109,7 +108,7 @@ func Open(dir string, opts ...Option) (*DB, error) {
 		dir:     filepath.Clean(dir),
 		opts:    o,
 		colls:   map[string]map[string]json.RawMessage{},
-		dirty:   map[string]uint64{},
+		dirty:   map[string]bool{},
 		dropped: map[string]bool{},
 		log:     log,
 		flock:   flock,

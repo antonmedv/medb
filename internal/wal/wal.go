@@ -116,6 +116,16 @@ func (l *Log) Size() int64 {
 	return l.size.Load()
 }
 
+// Drain commits every queued record. Called from inside Exec, where fn owns the
+// commit goroutine, it makes the log hold everything enqueued so far, including
+// the records that arrived while the previous commit was syncing.
+func (l *Log) Drain() error {
+	l.commit()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.failed
+}
+
 func (l *Log) Truncate() error {
 	if err := l.f.Truncate(0); err != nil {
 		return err
@@ -140,13 +150,9 @@ func (l *Log) run() {
 		case <-l.notify:
 			l.commit()
 		case req := <-l.exec:
-			l.commit()
-			// commit records a failure synchronously, so checking here keeps a
+			// Draining records a failure synchronously, so checking here keeps a
 			// poisoned log from being snapshotted and truncated.
-			l.mu.Lock()
-			err := l.failed
-			l.mu.Unlock()
-			if err != nil {
+			if err := l.Drain(); err != nil {
 				req.err <- err
 				continue
 			}

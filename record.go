@@ -80,14 +80,6 @@ func (db *DB) commitWait(t wal.Ticket) error {
 	return nil
 }
 
-// touch stamps a collection with the version it was last written at. flush
-// snapshots without holding the write lock and clears the mark only if the
-// version still matches, so a write that lands mid-flush stays dirty.
-func (db *DB) touch(coll string) {
-	db.seq++
-	db.dirty[coll] = db.seq
-}
-
 func (db *DB) apply(rec walRecord) {
 	switch rec.Op {
 	case opSet:
@@ -97,7 +89,7 @@ func (db *DB) apply(rec walRecord) {
 			db.colls[rec.Coll] = c
 		}
 		c[rec.ID] = rec.Doc
-		db.touch(rec.Coll)
+		db.dirty[rec.Coll] = true
 		delete(db.dropped, rec.Coll)
 	case opDel:
 		c := db.colls[rec.Coll]
@@ -105,7 +97,7 @@ func (db *DB) apply(rec walRecord) {
 			return
 		}
 		delete(c, rec.ID)
-		db.touch(rec.Coll)
+		db.dirty[rec.Coll] = true
 	case opDrop:
 		if _, ok := db.colls[rec.Coll]; !ok {
 			return

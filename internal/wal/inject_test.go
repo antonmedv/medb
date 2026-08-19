@@ -249,3 +249,51 @@ func TestTruncateSyncFailure(t *testing.T) {
 		t.Fatal("Size() reset despite a failed sync")
 	}
 }
+
+// A record enqueued while fn owns the commit goroutine has no other way to
+// reach the log: Drain is how fn catches the log up to memory before it
+// snapshots and truncates.
+func TestDrain(t *testing.T) {
+	f := &fakeFile{}
+	l := newLog(f, 0)
+	defer l.Close()
+
+	if err := l.Drain(); err != nil {
+		t.Fatalf("draining an empty log: %v", err)
+	}
+	if err := l.Exec(func() error {
+		l.Enqueue([]byte("late"))
+		return l.Drain()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.contents(); got != "late\n" {
+		t.Fatalf("log holds %q, want the record Drain committed", got)
+	}
+	if l.Size() != int64(len("late\n")) {
+		t.Fatalf("size %d, want %d", l.Size(), len("late\n"))
+	}
+}
+
+func TestDrainReportsFailure(t *testing.T) {
+	want := errors.New("sync failed")
+	f := &fakeFile{}
+	l := newLog(f, 0)
+	defer l.Close()
+
+	f.fail(nil, want)
+	var drainErr error
+	if err := l.Exec(func() error {
+		l.Enqueue([]byte("doomed"))
+		drainErr = l.Drain()
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(drainErr, want) {
+		t.Fatalf("Drain returned %v, want %v", drainErr, want)
+	}
+	if l.Size() != 0 {
+		t.Fatalf("size %d after a failed sync, want 0", l.Size())
+	}
+}

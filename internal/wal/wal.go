@@ -138,6 +138,15 @@ func (l *Log) run() {
 			l.commit()
 		case req := <-l.exec:
 			l.commit()
+			// commit records a failure synchronously, so checking here keeps a
+			// poisoned log from being snapshotted and truncated.
+			l.mu.Lock()
+			err := l.failed
+			l.mu.Unlock()
+			if err != nil {
+				req.err <- err
+				continue
+			}
 			req.err <- req.fn()
 		case <-l.stop:
 			l.commit()

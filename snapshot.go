@@ -45,6 +45,11 @@ func (db *DB) tryFlush() {
 
 func (db *DB) flush() error {
 	db.mu.Lock()
+	if db.failed != nil {
+		err := db.failed
+		db.mu.Unlock()
+		return err
+	}
 	snaps := make(map[string][]byte, len(db.dirty))
 	for name := range db.dirty {
 		c, ok := db.colls[name]
@@ -93,7 +98,11 @@ func (db *DB) writeSnapshot(name string, data []byte) error {
 		return err
 	}
 	for d := filepath.Dir(path); d != db.dir; {
-		d = filepath.Dir(d)
+		parent := filepath.Dir(d)
+		if parent == d {
+			return fmt.Errorf("medb: snapshot path %s escapes %s", path, db.dir)
+		}
+		d = parent
 		if err := fsutil.SyncDir(d); err != nil {
 			return err
 		}
@@ -136,15 +145,18 @@ func (db *DB) replay() error {
 	if err != nil {
 		return err
 	}
-	for _, payload := range recs {
+	for i, payload := range recs {
 		var rec walRecord
-		if json.Unmarshal(payload, &rec) != nil {
-			break
+		if err := json.Unmarshal(payload, &rec); err != nil {
+			return fmt.Errorf("medb: corrupt wal record %d in %s: %w", i+1, db.walPath(), err)
+		}
+		if err := rec.valid(); err != nil {
+			return fmt.Errorf("medb: invalid wal record %d in %s: %w", i+1, db.walPath(), err)
 		}
 		db.apply(rec)
 	}
 	if db.log.Size() > 0 {
-		return db.flush()
+		return db.log.Exec(db.flush)
 	}
 	return nil
 }

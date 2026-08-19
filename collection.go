@@ -7,6 +7,8 @@ import (
 	"iter"
 	"maps"
 	"slices"
+
+	"github.com/antonmedv/medb/internal/wal"
 )
 
 var errEmptyID = errors.New("medb: empty document id")
@@ -52,13 +54,12 @@ func (c *Collection[T]) Set(id string, doc T) error {
 	if err := db.checkDocSize(raw); err != nil {
 		return err
 	}
-	db.mu.Lock()
-	if err := db.writable(); err != nil {
-		db.mu.Unlock()
+	rec := walRecord{Op: opSet, Coll: c.name, ID: id, Doc: raw}
+	payload, err := encode(rec)
+	if err != nil {
 		return err
 	}
-	t, err := db.enqueue(walRecord{Op: opSet, Coll: c.name, ID: id, Doc: raw})
-	db.mu.Unlock()
+	t, err := db.stage(rec, payload)
 	if err != nil {
 		return err
 	}
@@ -67,61 +68,61 @@ func (c *Collection[T]) Set(id string, doc T) error {
 
 func (c *Collection[T]) Delete(id string) error {
 	db := c.db
-	db.mu.Lock()
-	if err := db.writable(); err != nil {
-		db.mu.Unlock()
+	rec := walRecord{Op: opDel, Coll: c.name, ID: id}
+	payload, err := encode(rec)
+	if err != nil {
 		return err
 	}
-	if _, ok := db.colls[c.name][id]; !ok {
-		db.mu.Unlock()
-		return nil
-	}
-	t, err := db.enqueue(walRecord{Op: opDel, Coll: c.name, ID: id})
-	db.mu.Unlock()
+	t, err := db.stage(rec, payload)
 	if err != nil {
 		return err
 	}
 	return db.commitWait(t)
 }
 
-// fn runs while holding the database write lock and must not call back into the DB.
+// fn runs while holding the database write lock and must not block or call
+// back into the DB.
 func (c *Collection[T]) Update(id string, fn func(T) (T, error)) error {
+	t, err := c.stageUpdate(id, fn)
+	if err != nil {
+		return err
+	}
+	return c.db.commitWait(t)
+}
+
+func (c *Collection[T]) stageUpdate(id string, fn func(T) (T, error)) (wal.Ticket, error) {
 	db := c.db
 	db.mu.Lock()
+	defer db.mu.Unlock()
 	if err := db.writable(); err != nil {
-		db.mu.Unlock()
-		return err
+		return wal.Ticket{}, err
 	}
 	raw, ok := db.colls[c.name][id]
 	if !ok {
-		db.mu.Unlock()
-		return ErrNotFound
+		return wal.Ticket{}, ErrNotFound
 	}
 	var v T
 	if err := json.Unmarshal(raw, &v); err != nil {
-		db.mu.Unlock()
-		return err
+		return wal.Ticket{}, err
 	}
 	v, err := fn(v)
 	if err != nil {
-		db.mu.Unlock()
-		return err
+		return wal.Ticket{}, err
 	}
 	out, err := json.Marshal(v)
 	if err != nil {
-		db.mu.Unlock()
-		return err
+		return wal.Ticket{}, err
 	}
 	if err := db.checkDocSize(out); err != nil {
-		db.mu.Unlock()
-		return err
+		return wal.Ticket{}, err
 	}
-	t, err := db.enqueue(walRecord{Op: opSet, Coll: c.name, ID: id, Doc: out})
-	db.mu.Unlock()
+	rec := walRecord{Op: opSet, Coll: c.name, ID: id, Doc: out}
+	payload, err := encode(rec)
 	if err != nil {
-		return err
+		return wal.Ticket{}, err
 	}
-	return db.commitWait(t)
+	db.apply(rec)
+	return db.log.Enqueue(payload), nil
 }
 
 func (c *Collection[T]) Has(id string) bool {

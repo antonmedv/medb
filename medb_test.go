@@ -1,6 +1,7 @@
 package medb_test
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -171,23 +172,107 @@ func TestTornTail(t *testing.T) {
 	}
 }
 
-func TestCorruptRecordStopsReplay(t *testing.T) {
+func corruptWALLine(t *testing.T, dir string, line int) {
+	t.Helper()
+	path := filepath.Join(dir, "wal.log")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := bytes.SplitAfter(data, []byte("\n"))
+	if line >= len(lines) {
+		t.Fatalf("wal has %d lines, cannot corrupt line %d", len(lines), line)
+	}
+	lines[line][0] = '!'
+	if err := os.WriteFile(path, bytes.Join(lines, nil), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A record that is newline terminated but unparseable is mid-log corruption,
+// not a torn tail: refusing to open keeps the committed records that follow it
+// recoverable instead of truncating them away.
+func TestCorruptRecordFailsOpen(t *testing.T) {
 	dir := t.TempDir()
 	db := open(t, dir, medb.WithFlushInterval(time.Hour))
-	defer db.Close()
 	seed(t, medb.C[user](db, "users"), 3)
-
 	crashed := crash(t, dir)
-	appendToWAL(t, crashed, `{"op":"set","coll":"users","id":"u9","doc":{"name":`+"\n")
+	db.Close()
 
-	db2 := open(t, crashed)
-	defer db2.Close()
-	users := medb.C[user](db2, "users")
-	if users.Count() != 3 {
-		t.Fatalf("recovered %d docs, want 3", users.Count())
+	appendToWAL(t, crashed, `{"op":"set","coll":"users","id":"u9","doc":{"name":`+"\n")
+	before := walSize(t, crashed)
+
+	if _, err := medb.Open(crashed); err == nil {
+		t.Fatal("Open accepted a corrupt wal record")
 	}
-	if users.Has("u9") {
-		t.Fatal("unparseable record was applied")
+	if after := walSize(t, crashed); after != before {
+		t.Fatalf("wal went from %d to %d bytes: committed records were destroyed", before, after)
+	}
+}
+
+func TestCorruptMiddleRecordPreservesLog(t *testing.T) {
+	dir := t.TempDir()
+	db := open(t, dir, medb.WithFlushInterval(time.Hour))
+	seed(t, medb.C[user](db, "users"), 3)
+	crashed := crash(t, dir)
+	db.Close()
+
+	before := walSize(t, crashed)
+	corruptWALLine(t, crashed, 1)
+
+	if _, err := medb.Open(crashed); err == nil {
+		t.Fatal("Open accepted a corrupt wal record")
+	}
+	if after := walSize(t, crashed); after != before {
+		t.Fatalf("wal went from %d to %d bytes: committed records were destroyed", before, after)
+	}
+	if _, err := os.Stat(filepath.Join(crashed, "users.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("an aborted replay still wrote a snapshot")
+	}
+}
+
+func TestUnknownOpFailsOpen(t *testing.T) {
+	dir := t.TempDir()
+	db := open(t, dir, medb.WithFlushInterval(time.Hour))
+	seed(t, medb.C[user](db, "users"), 1)
+	crashed := crash(t, dir)
+	db.Close()
+
+	appendToWAL(t, crashed, `{"op":"nuke","coll":"users","id":"x"}`+"\n")
+	if _, err := medb.Open(crashed); err == nil {
+		t.Fatal("Open accepted a record with an unknown op")
+	}
+}
+
+func TestWALPathTraversalRejected(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "db")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rec := `{"op":"set","coll":"a/../../escape","id":"x","doc":{"name":"pwned"}}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "wal.log"), []byte(rec), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	opened := make(chan error, 1)
+	go func() {
+		db, err := medb.Open(dir)
+		if db != nil {
+			db.Close()
+		}
+		opened <- err
+	}()
+	select {
+	case err := <-opened:
+		if err == nil {
+			t.Fatal("Open accepted a collection name that escapes the database directory")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Open hung: the ancestor sync loop is unbounded")
+	}
+	if _, err := os.Stat(filepath.Join(base, "escape.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a file was written outside the database directory: %v", err)
 	}
 }
 
@@ -471,5 +556,80 @@ func TestNewID(t *testing.T) {
 	a, b := medb.NewID(), medb.NewID()
 	if len(a) != 32 || a == b {
 		t.Fatalf("ids %q %q", a, b)
+	}
+}
+
+// A panic inside Update's callback must not leave the database locked.
+func TestUpdatePanicKeepsDBUsable(t *testing.T) {
+	db := open(t, t.TempDir())
+	defer db.Close()
+	users := medb.C[user](db, "users")
+	if err := users.Set("a", user{Name: "A", Age: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("panic did not propagate to the caller")
+			}
+		}()
+		users.Update("a", func(u user) (user, error) {
+			var m map[string]int
+			m["boom"] = 1
+			return u, nil
+		})
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := users.Set("b", user{Name: "B"}); err != nil {
+			t.Error(err)
+		}
+		got, err := users.Get("a")
+		if err != nil {
+			t.Error(err)
+		}
+		if got.Age != 1 {
+			t.Errorf("document changed despite the panic: %+v", got)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("db.mu still held after a panic inside Update's callback")
+	}
+}
+
+type panicMarshal struct{}
+
+func (panicMarshal) MarshalJSON() ([]byte, error) { panic("marshal boom") }
+
+func TestMarshalPanicKeepsDBUsable(t *testing.T) {
+	db := open(t, t.TempDir())
+	defer db.Close()
+	if err := medb.C[user](db, "users").Set("a", user{Name: "A"}); err != nil {
+		t.Fatal(err)
+	}
+
+	func() {
+		defer func() { recover() }()
+		medb.C[panicMarshal](db, "users").Update("a", func(p panicMarshal) (panicMarshal, error) {
+			return p, nil
+		})
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := medb.C[user](db, "users").Set("b", user{Name: "B"}); err != nil {
+			t.Error(err)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("db.mu still held after a panic inside json.Marshal")
 	}
 }

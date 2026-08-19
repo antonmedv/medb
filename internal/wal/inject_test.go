@@ -173,3 +173,44 @@ func TestTruncateFailure(t *testing.T) {
 		t.Fatal("Size() reset despite a failed truncate")
 	}
 }
+
+// A poisoned log must not run a flush: medb truncates the log inside Exec, so
+// running fn here would make a write that failed durable and destroy the log.
+func TestExecSkippedAfterFailure(t *testing.T) {
+	want := errors.New("sync failed")
+	f := &fakeFile{syncErr: want}
+	l := newLog(f, 0)
+	defer l.Close()
+
+	if err := l.Enqueue([]byte("a")).Wait(); !errors.Is(err, want) {
+		t.Fatalf("got %v, want %v", err, want)
+	}
+	ran := false
+	err := l.Exec(func() error {
+		ran = true
+		return nil
+	})
+	if !errors.Is(err, want) {
+		t.Fatalf("Exec returned %v, want %v", err, want)
+	}
+	if ran {
+		t.Fatal("fn ran on a poisoned log")
+	}
+}
+
+func TestExecRunsWhileHealthy(t *testing.T) {
+	f := &fakeFile{}
+	l := newLog(f, 0)
+	defer l.Close()
+
+	if err := l.Enqueue([]byte("a")).Wait(); err != nil {
+		t.Fatal(err)
+	}
+	ran := false
+	if err := l.Exec(func() error { ran = true; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if !ran {
+		t.Fatal("fn did not run on a healthy log")
+	}
+}

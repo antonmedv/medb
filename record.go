@@ -2,6 +2,7 @@ package medb
 
 import (
 	"encoding/json"
+	"fmt"
 
 	"github.com/antonmedv/medb/internal/wal"
 )
@@ -19,11 +20,36 @@ type walRecord struct {
 	Doc  json.RawMessage `json:"doc,omitempty"`
 }
 
-// Replay applies records in log order, so the in-memory update and the
-// log enqueue must happen under one db.mu hold to keep both orders identical.
-func (db *DB) enqueue(rec walRecord) (wal.Ticket, error) {
-	payload, err := json.Marshal(rec)
-	if err != nil {
+func encode(rec walRecord) ([]byte, error) {
+	return json.Marshal(rec)
+}
+
+// The log is the one input that reaches the filesystem without going through
+// C or Drop, so a replayed name must be checked before it becomes a path.
+func (rec walRecord) valid() error {
+	if !validName(rec.Coll) {
+		return fmt.Errorf("invalid collection name %q", rec.Coll)
+	}
+	switch rec.Op {
+	case opSet, opDel:
+		if rec.ID == "" {
+			return fmt.Errorf("%s record with no id", rec.Op)
+		}
+	case opDrop:
+	default:
+		return fmt.Errorf("unknown op %q", rec.Op)
+	}
+	return nil
+}
+
+// stage applies rec to memory and queues payload under one db.mu hold, so the
+// order of records in the log matches the order of updates to the maps. It
+// returns the ticket rather than waiting on it: flush takes db.mu from the
+// commit goroutine, so waiting here would deadlock.
+func (db *DB) stage(rec walRecord, payload []byte) (wal.Ticket, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if err := db.writable(); err != nil {
 		return wal.Ticket{}, err
 	}
 	db.apply(rec)
@@ -56,9 +82,16 @@ func (db *DB) apply(rec walRecord) {
 		db.dirty[rec.Coll] = true
 		delete(db.dropped, rec.Coll)
 	case opDel:
-		delete(db.colls[rec.Coll], rec.ID)
+		c := db.colls[rec.Coll]
+		if _, ok := c[rec.ID]; !ok {
+			return
+		}
+		delete(c, rec.ID)
 		db.dirty[rec.Coll] = true
 	case opDrop:
+		if _, ok := db.colls[rec.Coll]; !ok {
+			return
+		}
 		delete(db.colls, rec.Coll)
 		delete(db.dirty, rec.Coll)
 		db.dropped[rec.Coll] = true

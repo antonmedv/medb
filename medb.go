@@ -137,17 +137,12 @@ func (db *DB) Collections() []string {
 
 func (db *DB) Drop(name string) error {
 	mustValidName(name)
-	db.mu.Lock()
-	if err := db.writable(); err != nil {
-		db.mu.Unlock()
+	rec := walRecord{Op: opDrop, Coll: name}
+	payload, err := encode(rec)
+	if err != nil {
 		return err
 	}
-	if _, ok := db.colls[name]; !ok {
-		db.mu.Unlock()
-		return nil
-	}
-	t, err := db.enqueue(walRecord{Op: opDrop, Coll: name})
-	db.mu.Unlock()
+	t, err := db.stage(rec, payload)
 	if err != nil {
 		return err
 	}

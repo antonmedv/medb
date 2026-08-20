@@ -195,18 +195,30 @@ func TestTornWALTail(t *testing.T) {
 }
 
 func TestCorruptWALRecord(t *testing.T) {
-	dir := t.TempDir()
-	// A complete (newline-terminated) but non-JSON record is corruption,
-	// not a torn tail, and must fail loudly.
-	if err := os.WriteFile(filepath.Join(dir, "wal.log"), []byte("{oops\n"), 0o600); err != nil {
-		t.Fatal(err)
+	// A complete (newline-terminated) but malformed record is corruption,
+	// not a torn tail, and must fail loudly. Valid JSON with a bogus
+	// collection name or a missing document is just as corrupt as garbage:
+	// accepting it would plant undecodable state (a nil doc makes All panic)
+	// or write snapshot files outside the collection namespace.
+	records := map[string]string{
+		"not json":     "{oops\n",
+		"invalid name": `{"op":"set","coll":"UPPER","id":"a","doc":1}` + "\n",
+		"missing doc":  `{"op":"set","coll":"users","id":"a"}` + "\n",
 	}
-	_, err := medb.Open(dir)
-	if err == nil {
-		t.Fatal("Open succeeded on corrupt WAL")
-	}
-	if !strings.Contains(err.Error(), "corrupt wal record") {
-		t.Fatalf("error does not identify the corruption: %v", err)
+	for name, rec := range records {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "wal.log"), []byte(rec), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := medb.Open(dir)
+			if err == nil {
+				t.Fatal("Open succeeded on corrupt WAL")
+			}
+			if !strings.Contains(err.Error(), "corrupt wal record") {
+				t.Fatalf("error does not identify the corruption: %v", err)
+			}
+		})
 	}
 }
 

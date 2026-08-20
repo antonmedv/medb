@@ -3,6 +3,10 @@ package medb
 import (
 	"errors"
 	"fmt"
+	"maps"
+	"os"
+	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -183,6 +187,138 @@ func TestSnapshotTruncateFailurePreservesData(t *testing.T) {
 		if got, err := users.Get(id); err != nil || got != want {
 			t.Fatalf("%s = %q, %v, want %q", id, got, err, want)
 		}
+	}
+}
+
+// powerLog simulates a disk with a volatile write cache: Write lands in the
+// cache, Sync moves the cache to the durable image. A power cut keeps the
+// durable image plus an arbitrary prefix of the cache — exactly the fsync
+// contract. Unlike the SIGKILL harness in crash_test.go (a killed process
+// keeps the OS page cache, so even unsynced writes survive), this catches a
+// missing or misplaced Sync in the commit path.
+type powerLog struct {
+	inner file // real WAL handle, kept only so Close releases it
+	mu    sync.Mutex
+	disk  []byte // synced: survives the cut
+	cache []byte // written, not synced: may partially survive
+}
+
+func (p *powerLog) Write(b []byte) (int, error) {
+	p.mu.Lock()
+	p.cache = append(p.cache, b...)
+	p.mu.Unlock()
+	return len(b), nil
+}
+
+func (p *powerLog) Sync() error {
+	p.mu.Lock()
+	p.disk = append(p.disk, p.cache...)
+	p.cache = p.cache[:0]
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *powerLog) Truncate(int64) error {
+	p.mu.Lock()
+	p.disk, p.cache = nil, nil
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *powerLog) Close() error { return p.inner.Close() }
+
+// cut returns the two survival layers at the moment of power loss.
+func (p *powerLog) cut() (disk, cache []byte) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.disk), slices.Clone(p.cache)
+}
+
+// Every Set acknowledged before a power cut must be recoverable from the
+// bytes that were synced at that moment, regardless of how much of the
+// unsynced tail survives or where it tears.
+func TestPowerLossDurability(t *testing.T) {
+	for round, cutAfter := range []int64{10, 40, 80} {
+		t.Run(fmt.Sprintf("round%d", round), func(t *testing.T) {
+			pl := &powerLog{}
+			db, err := Open(t.TempDir(), WithFlushInterval(time.Hour))
+			if err != nil {
+				t.Fatal(err)
+			}
+			pl.inner = db.log
+			db.log = pl
+
+			docs := C[int](db, "docs")
+
+			var (
+				mu    sync.Mutex
+				acked = map[string]int{}
+				total atomic.Int64
+				stop  atomic.Bool
+			)
+			var wg sync.WaitGroup
+			for w := range 4 {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for i := 0; !stop.Load(); i++ {
+						id := fmt.Sprintf("w%d-%d", w, i)
+						if err := docs.Set(id, i); err != nil {
+							t.Errorf("Set(%s): %v", id, err)
+							return
+						}
+						mu.Lock()
+						acked[id] = i
+						mu.Unlock()
+						total.Add(1)
+					}
+				}()
+			}
+			waitUntil(t, 10*time.Second, func() bool { return total.Load() >= cutAfter })
+
+			// Power cut: freeze the acknowledged set first, then read the
+			// disk. The disk only grows, so everything acknowledged before
+			// the freeze is covered by the later read.
+			mu.Lock()
+			ackedAtCut := maps.Clone(acked)
+			mu.Unlock()
+			disk, cache := pl.cut()
+
+			stop.Store(true)
+			wg.Wait()
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			for name, tail := range map[string][]byte{
+				"no unsynced tail":   nil,
+				"torn unsynced tail": cache[:len(cache)/2],
+				"full unsynced tail": cache,
+			} {
+				t.Run(name, func(t *testing.T) {
+					dir := t.TempDir()
+					wal := append(slices.Clone(disk), tail...)
+					if err := os.WriteFile(filepath.Join(dir, "wal.log"), wal, 0o600); err != nil {
+						t.Fatal(err)
+					}
+					reopened, err := Open(dir)
+					if err != nil {
+						t.Fatalf("Open after power cut: %v", err)
+					}
+					defer reopened.Close()
+					docs := C[int](reopened, "docs")
+					for id, want := range ackedAtCut {
+						got, err := docs.Get(id)
+						if err != nil {
+							t.Fatalf("acknowledged %s lost after power cut: %v", id, err)
+						}
+						if got != want {
+							t.Fatalf("%s = %d, want %d", id, got, want)
+						}
+					}
+				})
+			}
+		})
 	}
 }
 

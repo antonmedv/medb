@@ -11,5 +11,5 @@ func Acquire(path string) (*os.File, error) {
 }
 
 func Release(f *os.File) error {
-	return nil, ErrNotSupported
+	return ErrNotSupported
 }

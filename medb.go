@@ -79,11 +79,10 @@ type DB struct {
 	spare   [][]byte
 	commit  *commit
 
-	snapshot chan struct{}
-	notify   chan struct{}
-	stop     chan struct{}
-	done     sync.WaitGroup
-	failed   error
+	notify chan struct{}
+	stop   chan struct{}
+	done   sync.WaitGroup
+	failed error
 }
 
 func Open(dir string, opts ...Option) (*DB, error) {
@@ -112,16 +111,15 @@ func Open(dir string, opts ...Option) (*DB, error) {
 		return nil, err
 	}
 	db := &DB{
-		flock:    flock,
-		dir:      filepath.Clean(dir),
-		opts:     o,
-		colls:    map[string]map[string]json.RawMessage{},
-		dirty:    map[string]bool{},
-		dropped:  map[string]bool{},
-		log:      log,
-		snapshot: make(chan struct{}, 1),
-		notify:   make(chan struct{}, 1),
-		stop:     make(chan struct{}),
+		flock:   flock,
+		dir:     filepath.Clean(dir),
+		opts:    o,
+		colls:   map[string]map[string]json.RawMessage{},
+		dirty:   map[string]bool{},
+		dropped: map[string]bool{},
+		log:     log,
+		notify:  make(chan struct{}, 1),
+		stop:    make(chan struct{}),
 	}
 	if err := db.load(); err != nil {
 		_ = lock.Release(flock)
@@ -202,8 +200,9 @@ func (db *DB) run() {
 		select {
 		case <-db.notify:
 			err = db.writeLog(err)
-		case <-db.snapshot:
-			err = db.writeSnapshot(err)
+			if db.size.Load() >= db.opts.flushBytes {
+				err = db.writeSnapshot(err)
+			}
 		case <-ticker.C:
 			err = db.writeSnapshot(err)
 		case <-db.stop:

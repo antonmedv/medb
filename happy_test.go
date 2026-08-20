@@ -425,6 +425,38 @@ func TestFlushIntervalWritesSnapshot(t *testing.T) {
 	})
 }
 
+func TestSnapshotSkipsCleanCollections(t *testing.T) {
+	dir := t.TempDir()
+	db := openDB(t, dir, medb.WithFlushInterval(25*time.Millisecond))
+	defer closeDB(t, db)
+
+	set(t, medb.C[User](db, "users"), "u1", User{Name: "Ada"})
+	path := filepath.Join(dir, "users.json")
+	waitFor(t, 2*time.Second, func() bool {
+		_, err := os.Stat(path)
+		return err == nil
+	})
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Keep other collections flushing while users stays clean.
+	logs := medb.C[User](db, "logs")
+	for i := range 4 {
+		set(t, logs, fmt.Sprintf("l%d", i), User{Age: i})
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Fatal("clean collection was rewritten by a later snapshot")
+	}
+}
+
 func TestFlushBytesWritesSnapshot(t *testing.T) {
 	dir := t.TempDir()
 	db := openDB(t, dir,

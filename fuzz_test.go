@@ -1,12 +1,12 @@
-package medb_test
+// White-box (package medb) so FuzzValidName can check validName against an
+// independent reference without exporting it.
+package medb
 
 import (
 	"os"
 	"path/filepath"
 	"regexp"
 	"testing"
-
-	"github.com/antonmedv/medb"
 )
 
 // The reference definition of a valid collection name, kept independent of
@@ -21,7 +21,7 @@ func FuzzValidName(f *testing.F) {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, name string) {
-		if got, want := medb.ValidName(name), validNameRef.MatchString(name); got != want {
+		if got, want := validName(name), validNameRef.MatchString(name); got != want {
 			t.Fatalf("validName(%q) = %v, reference says %v", name, got, want)
 		}
 	})
@@ -43,17 +43,17 @@ func FuzzWALReplay(f *testing.F) {
 		if err := os.WriteFile(filepath.Join(dir, "wal.log"), wal, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		db, err := medb.Open(dir)
+		db, err := Open(dir)
 		if err != nil {
 			return
 		}
 		for _, name := range db.Collections() {
 			// Replay does not validate names from the WAL, so Collections
 			// may return names C would reject; skip those.
-			if !medb.ValidName(name) {
+			if !validName(name) {
 				continue
 			}
-			for range medb.C[any](db, name).All() {
+			for range C[any](db, name).All() {
 			}
 		}
 		if err := db.Close(); err != nil {
@@ -78,11 +78,11 @@ func FuzzSnapshotLoad(f *testing.F) {
 		if err := os.WriteFile(filepath.Join(dir, "users.json"), snap, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		db, err := medb.Open(dir)
+		db, err := Open(dir)
 		if err != nil {
 			return
 		}
-		for range medb.C[any](db, "users").All() {
+		for range C[any](db, "users").All() {
 		}
 		if err := db.Close(); err != nil {
 			t.Fatalf("Close: %v", err)

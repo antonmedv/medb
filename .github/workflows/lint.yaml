@@ -1,0 +1,43 @@
+name: lint
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+permissions: {}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt-ed:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: go vet
+        run: |
+          go vet ./...
+          go vet -C cmd ./...
+      - name: staticcheck
+        run: |
+          go run honnef.co/go/tools/cmd/staticcheck@v0.8.0 ./...
+          cd cmd && go run honnef.co/go/tools/cmd/staticcheck@v0.8.0 ./...
+      - name: go mod tidy
+        run: |
+          go mod tidy -diff
+          go mod tidy -C cmd -diff

@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"op\":\"set\",\"Coll\":\"0\"}\n")

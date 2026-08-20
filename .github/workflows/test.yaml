@@ -25,7 +25,7 @@ jobs:
         with:
           go-version: ${{ matrix.go-version }}
       - name: Test
-        run: go test ./...
+        run: go test -timeout 180s ./...
 
   race:
     runs-on: ubuntu-latest
@@ -40,4 +40,4 @@ jobs:
         with:
           go-version: stable
       - name: Test
-        run: go test -race ./...
+        run: go test -race -timeout 180s ./...

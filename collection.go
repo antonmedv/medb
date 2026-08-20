@@ -51,10 +51,15 @@ func (c *Collection[T]) Set(id string, doc T) error {
 	if err := c.db.checkDocSize(raw); err != nil {
 		return err
 	}
-	commit, err := c.db.enqueue(record{Op: opSet, Coll: c.name, ID: id, Doc: raw})
+	rec := record{Op: opSet, Coll: c.name, ID: id, Doc: raw}
+	buf, err := json.Marshal(rec)
 	if err != nil {
 		return err
 	}
+	c.db.mu.Lock()
+	c.db.apply(rec)
+	commit := c.db.enqueue(buf)
+	c.db.mu.Unlock()
 	return commit.wait()
 }
 
@@ -65,42 +70,58 @@ func (c *Collection[T]) Delete(id string) error {
 	if closed {
 		return ErrClosed
 	}
-	commit, err := c.db.enqueue(record{Op: opDel, Coll: c.name, ID: id})
+	rec := record{Op: opDel, Coll: c.name, ID: id}
+	buf, err := json.Marshal(rec)
 	if err != nil {
 		return err
 	}
+	c.db.mu.Lock()
+	c.db.apply(rec)
+	commit := c.db.enqueue(buf)
+	c.db.mu.Unlock()
 	return commit.wait()
 }
 
 func (c *Collection[T]) Update(id string, fn func(T) (T, error)) error {
 	c.db.mu.Lock()
-	defer c.db.mu.Unlock()
 	if c.db.closed {
+		c.db.mu.Unlock()
 		return ErrClosed
 	}
 	raw, ok := c.db.colls[c.name][id]
 	if !ok {
+		c.db.mu.Unlock()
 		return ErrNotFound
 	}
 	var v T
 	if err := json.Unmarshal(raw, &v); err != nil {
+		c.db.mu.Unlock()
 		return err
 	}
 	v, err := fn(v)
 	if err != nil {
+		c.db.mu.Unlock()
 		return err
 	}
 	out, err := json.Marshal(v)
 	if err != nil {
+		c.db.mu.Unlock()
 		return err
 	}
 	if err := c.db.checkDocSize(out); err != nil {
+		c.db.mu.Unlock()
 		return err
 	}
-	commit, err := c.db.enqueue(record{Op: opSet, Coll: c.name, ID: id, Doc: out})
+
+	rec := record{Op: opSet, Coll: c.name, ID: id, Doc: out}
+	buf, err := json.Marshal(rec)
 	if err != nil {
+		c.db.mu.Unlock()
 		return err
 	}
+	c.db.apply(rec)
+	commit := c.db.enqueue(buf)
+	c.db.mu.Unlock()
 	return commit.wait()
 }
 

@@ -32,42 +32,34 @@ func openLog(path string) (file, error) {
 	return f, nil
 }
 
-func (db *DB) enqueue(record record) (*commit, error) {
-	b, err := json.Marshal(record)
-	if err != nil {
-		return nil, err
-	}
-	payload := encodedRecord{
-		rec: record,
-		b:   b,
-	}
-	db.mu.Lock()
+func (db *DB) enqueue(rec []byte) *commit {
+	db.logMu.Lock()
 	if db.commit == nil {
 		db.commit = &commit{done: make(chan struct{})}
 	}
 	c := db.commit
-	db.pending = append(db.pending, payload)
-	db.mu.Unlock()
+	db.pending = append(db.pending, rec)
+	db.logMu.Unlock()
 	select {
 	case db.notify <- struct{}{}:
 	default:
 	}
-	return c, nil
+	return c
 }
 
 func (db *DB) writeLog(err error) error {
-	db.mu.Lock()
+	db.logMu.Lock()
 	batch, commit := db.pending, db.commit
 	db.pending, db.spare = db.spare[:0], db.pending
 	db.commit = nil
-	db.mu.Unlock()
+	db.logMu.Unlock()
 	if commit == nil {
 		return err
 	}
 	if err == nil && len(batch) > 0 {
 		db.buf = db.buf[:0]
-		for _, x := range batch {
-			db.buf = append(db.buf, x.b...)
+		for _, rec := range batch {
+			db.buf = append(db.buf, rec...)
 			db.buf = append(db.buf, '\n')
 		}
 		if _, err = db.log.Write(db.buf); err == nil {
@@ -75,11 +67,6 @@ func (db *DB) writeLog(err error) error {
 		}
 		if err == nil {
 			db.size.Add(int64(len(db.buf)))
-		}
-	}
-	if err == nil {
-		for _, x := range batch {
-			db.apply(x.rec)
 		}
 	}
 	commit.err = err

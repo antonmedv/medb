@@ -10,11 +10,6 @@ const (
 	opDrop = "drop"
 )
 
-type encodedRecord struct {
-	rec record
-	b   []byte
-}
-
 type record struct {
 	Op   string          `json:"op"`
 	Coll string          `json:"coll"`

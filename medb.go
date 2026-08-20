@@ -71,11 +71,12 @@ type DB struct {
 	dropped map[string]bool
 	closed  bool
 
+	logMu   sync.Mutex
 	log     file
 	size    atomic.Int64
 	buf     []byte
-	pending []encodedRecord
-	spare   []encodedRecord
+	pending [][]byte
+	spare   [][]byte
 	commit  *commit
 
 	snapshot chan struct{}
@@ -179,10 +180,15 @@ func (db *DB) Drop(name string) error {
 	if closed {
 		return ErrClosed
 	}
-	commit, err := db.enqueue(record{Op: opDrop, Coll: name})
+	rec := record{Op: opDrop, Coll: name}
+	buf, err := json.Marshal(rec)
 	if err != nil {
 		return err
 	}
+	db.mu.Lock()
+	db.apply(rec)
+	commit := db.enqueue(buf)
+	db.mu.Unlock()
 	return commit.wait()
 }
 

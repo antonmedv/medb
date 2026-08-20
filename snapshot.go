@@ -17,6 +17,7 @@ func (db *DB) writeSnapshot(err error) error {
 		return err
 	}
 	db.mu.RLock()
+	defer db.mu.RUnlock()
 	for name := range db.dirty {
 		b, err := json.Marshal(db.colls[name])
 		if err != nil {
@@ -31,13 +32,13 @@ func (db *DB) writeSnapshot(err error) error {
 			return err
 		}
 	}
-	if err = db.log.Truncate(0); err == nil {
-		err = db.log.Sync()
+	if err := db.log.Truncate(0); err != nil {
+		return err
 	}
-	if err == nil {
-		db.size.Store(0)
+	if err := db.log.Sync(); err != nil {
+		return err
 	}
-	db.mu.RUnlock()
+	db.size.Store(0)
 	return nil
 }
 

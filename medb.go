@@ -181,6 +181,7 @@ func (db *DB) Drop(name string) error {
 	}
 	db.mu.Lock()
 	if db.closed {
+		db.mu.Unlock()
 		return ErrClosed
 	}
 	db.apply(rec)

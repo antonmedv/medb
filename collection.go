@@ -52,6 +52,7 @@ func (c *Collection[T]) Set(id string, doc T) error {
 	}
 	c.db.mu.Lock()
 	if c.db.closed {
+		c.db.mu.Unlock()
 		return ErrClosed
 	}
 	c.db.apply(rec)
@@ -68,6 +69,7 @@ func (c *Collection[T]) Delete(id string) error {
 	}
 	c.db.mu.Lock()
 	if c.db.closed {
+		c.db.mu.Unlock()
 		return ErrClosed
 	}
 	c.db.apply(rec)

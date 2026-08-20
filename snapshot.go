@@ -2,6 +2,7 @@ package medb
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -53,7 +54,12 @@ func (db *DB) writeColl(name string, data []byte) error {
 
 func (db *DB) removeColl(name string) error {
 	path := db.collPath(name)
-	if err := os.Remove(path); err != nil {
+	switch err := os.Remove(path); {
+	case errors.Is(err, fs.ErrNotExist):
+		// Dropped before its first flush: there is no file, and for a
+		// namespaced collection no parent directory to sync either.
+		return nil
+	case err != nil:
 		return err
 	}
 	return fsutil.SyncDir(filepath.Dir(path))

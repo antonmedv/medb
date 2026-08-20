@@ -174,18 +174,15 @@ func (db *DB) Collections() []string {
 
 func (db *DB) Drop(name string) error {
 	mustValidName(name)
-	db.mu.RLock()
-	closed := db.closed
-	db.mu.RUnlock()
-	if closed {
-		return ErrClosed
-	}
 	rec := record{Op: opDrop, Coll: name}
 	buf, err := json.Marshal(rec)
 	if err != nil {
 		return err
 	}
 	db.mu.Lock()
+	if db.closed {
+		return ErrClosed
+	}
 	db.apply(rec)
 	commit := db.enqueue(buf)
 	db.mu.Unlock()
@@ -206,6 +203,7 @@ func (db *DB) run() {
 		case <-ticker.C:
 			err = db.writeSnapshot(err)
 		case <-db.stop:
+			err = db.writeLog(err)
 			db.failed = db.writeSnapshot(err)
 			return
 		}

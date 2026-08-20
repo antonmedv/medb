@@ -38,12 +38,6 @@ func (c *Collection[T]) Get(id string) (T, error) {
 }
 
 func (c *Collection[T]) Set(id string, doc T) error {
-	c.db.mu.RLock()
-	closed := c.db.closed
-	c.db.mu.RUnlock()
-	if closed {
-		return ErrClosed
-	}
 	raw, err := json.Marshal(doc)
 	if err != nil {
 		return err
@@ -57,6 +51,9 @@ func (c *Collection[T]) Set(id string, doc T) error {
 		return err
 	}
 	c.db.mu.Lock()
+	if c.db.closed {
+		return ErrClosed
+	}
 	c.db.apply(rec)
 	commit := c.db.enqueue(buf)
 	c.db.mu.Unlock()
@@ -64,18 +61,15 @@ func (c *Collection[T]) Set(id string, doc T) error {
 }
 
 func (c *Collection[T]) Delete(id string) error {
-	c.db.mu.RLock()
-	closed := c.db.closed
-	c.db.mu.RUnlock()
-	if closed {
-		return ErrClosed
-	}
 	rec := record{Op: opDel, Coll: c.name, ID: id}
 	buf, err := json.Marshal(rec)
 	if err != nil {
 		return err
 	}
 	c.db.mu.Lock()
+	if c.db.closed {
+		return ErrClosed
+	}
 	c.db.apply(rec)
 	commit := c.db.enqueue(buf)
 	c.db.mu.Unlock()

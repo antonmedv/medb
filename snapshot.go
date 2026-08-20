@@ -16,10 +16,18 @@ func (db *DB) writeSnapshot(err error) error {
 	if err != nil {
 		return err
 	}
+	db.mu.Lock()
+	dirty, dropped := db.dirty, db.dropped
+	db.dirty, db.dropped = map[string]bool{}, map[string]bool{}
+	db.mu.Unlock()
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	for name := range db.dirty {
-		b, err := json.Marshal(db.colls[name])
+	for name := range dirty {
+		coll, ok := db.colls[name]
+		if !ok {
+			continue
+		}
+		b, err := json.Marshal(coll)
 		if err != nil {
 			return err
 		}
@@ -27,7 +35,7 @@ func (db *DB) writeSnapshot(err error) error {
 			return err
 		}
 	}
-	for name := range db.dropped {
+	for name := range dropped {
 		if err := db.removeColl(name); err != nil {
 			return err
 		}

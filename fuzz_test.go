@@ -48,11 +48,6 @@ func FuzzWALReplay(f *testing.F) {
 			return
 		}
 		for _, name := range db.Collections() {
-			// Replay does not validate names from the WAL, so Collections
-			// may return names C would reject; skip those.
-			if !validName(name) {
-				continue
-			}
 			for range C[any](db, name).All() {
 			}
 		}

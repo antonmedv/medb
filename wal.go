@@ -101,6 +101,12 @@ func (db *DB) replayLog(path string) error {
 		if err := json.Unmarshal(payload, &rec); err != nil {
 			return fmt.Errorf("medb: corrupt wal record %d in %s: %w", i+1, path, err)
 		}
+		if !validName(rec.Coll) {
+			return fmt.Errorf("medb: corrupt wal record %d in %s: invalid collection name %q", i+1, path, rec.Coll)
+		}
+		if rec.Op == opSet && len(rec.Doc) == 0 {
+			return fmt.Errorf("medb: corrupt wal record %d in %s: set record without doc", i+1, path)
+		}
 		db.apply(rec)
 	}
 	return nil

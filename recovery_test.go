@@ -210,6 +210,27 @@ func TestCorruptWALRecord(t *testing.T) {
 	}
 }
 
+func TestInvalidNameInWALIsCorruption(t *testing.T) {
+	dir := t.TempDir()
+	// A tampered-but-valid record with a traversal name must fail Open:
+	// applied, it would make the next snapshot write outside the DB
+	// directory and Collections return names C panics on.
+	rec := `{"op":"set","coll":"../evil","id":"x","doc":{}}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "wal.log"), []byte(rec), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := medb.Open(dir)
+	if err == nil {
+		t.Fatal("Open succeeded on WAL with a traversal collection name")
+	}
+	if !strings.Contains(err.Error(), "invalid collection name") {
+		t.Fatalf("error does not identify the invalid name: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "..", "evil.json")); !os.IsNotExist(err) {
+		t.Fatalf("evil.json escaped the DB directory: %v", err)
+	}
+}
+
 func TestCorruptSnapshot(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "users.json"), []byte("not json"), 0o600); err != nil {

@@ -173,8 +173,17 @@ func (db *DB) Collections() []string {
 
 func (db *DB) Drop(name string) error {
 	mustValidName(name)
-	rec := walRecord{Op: opDrop, Coll: name}
-	// TODO: write WAL, wait for commit, apply
+	db.mu.RLock()
+	closed := db.closed
+	db.mu.RUnlock()
+	if closed {
+		return ErrClosed
+	}
+	commit, err := db.enqueue(record{Op: opDrop, Coll: name})
+	if err != nil {
+		return err
+	}
+	return commit.wait()
 }
 
 func (db *DB) run() {
@@ -195,13 +204,6 @@ func (db *DB) run() {
 			return
 		}
 	}
-}
-
-func (db *DB) writable() error {
-	if db.closed {
-		return ErrClosed
-	}
-	return nil
 }
 
 func (db *DB) checkDocSize(raw []byte) error {

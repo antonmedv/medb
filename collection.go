@@ -2,14 +2,11 @@ package medb
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"iter"
 	"maps"
 	"slices"
 )
-
-var errEmptyID = errors.New("medb: empty document id")
 
 type Collection[T any] struct {
 	db   *DB
@@ -41,8 +38,11 @@ func (c *Collection[T]) Get(id string) (T, error) {
 }
 
 func (c *Collection[T]) Set(id string, doc T) error {
-	if id == "" {
-		return errEmptyID
+	c.db.mu.RLock()
+	closed := c.db.closed
+	c.db.mu.RUnlock()
+	if closed {
+		return ErrClosed
 	}
 	raw, err := json.Marshal(doc)
 	if err != nil {
@@ -59,15 +59,49 @@ func (c *Collection[T]) Set(id string, doc T) error {
 }
 
 func (c *Collection[T]) Delete(id string) error {
-	if id == "" {
-		return errEmptyID
+	c.db.mu.RLock()
+	closed := c.db.closed
+	c.db.mu.RUnlock()
+	if closed {
+		return ErrClosed
 	}
-	rec := record{Op: opDel, Coll: c.name, ID: id}
-	// TODO: write WAL, wait for commit, apply
+	commit, err := c.db.enqueue(record{Op: opDel, Coll: c.name, ID: id})
+	if err != nil {
+		return err
+	}
+	return commit.wait()
 }
 
 func (c *Collection[T]) Update(id string, fn func(T) (T, error)) error {
-	// TODO
+	c.db.mu.Lock()
+	defer c.db.mu.Unlock()
+	if c.db.closed {
+		return ErrClosed
+	}
+	raw, ok := c.db.colls[c.name][id]
+	if !ok {
+		return ErrNotFound
+	}
+	var v T
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return err
+	}
+	v, err := fn(v)
+	if err != nil {
+		return err
+	}
+	out, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	if err := c.db.checkDocSize(out); err != nil {
+		return err
+	}
+	commit, err := c.db.enqueue(record{Op: opSet, Coll: c.name, ID: id, Doc: out})
+	if err != nil {
+		return err
+	}
+	return commit.wait()
 }
 
 func (c *Collection[T]) Has(id string) bool {

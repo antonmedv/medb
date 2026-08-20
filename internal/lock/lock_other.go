@@ -3,10 +3,13 @@
 package lock
 
 import (
-	"errors"
 	"os"
 )
 
 func Acquire(path string) (*os.File, error) {
-	return nil, errors.New("medb: file locking is not supported on this platform")
+	return nil, ErrNotSupported
+}
+
+func Release(f *os.File) error {
+	return nil, ErrNotSupported
 }

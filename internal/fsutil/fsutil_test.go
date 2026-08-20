@@ -31,7 +31,7 @@ func TestWriteFile(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "data")
-			if err := fsutil.WriteFile(path, tc.data); err != nil {
+			if err := fsutil.WriteFileAtomic(path, tc.data); err != nil {
 				t.Fatal(err)
 			}
 			if got := read(t, path); !bytes.Equal(got, tc.data) {
@@ -46,10 +46,10 @@ func TestWriteFile(t *testing.T) {
 
 func TestWriteFileOverwrite(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "data")
-	if err := fsutil.WriteFile(path, []byte("old and longer")); err != nil {
+	if err := fsutil.WriteFileAtomic(path, []byte("old and longer")); err != nil {
 		t.Fatal(err)
 	}
-	if err := fsutil.WriteFile(path, []byte("new")); err != nil {
+	if err := fsutil.WriteFileAtomic(path, []byte("new")); err != nil {
 		t.Fatal(err)
 	}
 	if got := read(t, path); string(got) != "new" {
@@ -62,13 +62,13 @@ func TestWriteFileOverwrite(t *testing.T) {
 func TestWriteFileFailureKeepsOldContents(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "data")
 	old := []byte("old")
-	if err := fsutil.WriteFile(path, old); err != nil {
+	if err := fsutil.WriteFileAtomic(path, old); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Mkdir(path+".tmp", 0o700); err != nil { // makes creating the temp file fail
 		t.Fatal(err)
 	}
-	if err := fsutil.WriteFile(path, []byte("new")); err == nil {
+	if err := fsutil.WriteFileAtomic(path, []byte("new")); err == nil {
 		t.Fatal("want error, got nil")
 	}
 	if got := read(t, path); !bytes.Equal(got, old) {
@@ -81,14 +81,14 @@ func TestWriteFileRenameFailure(t *testing.T) {
 	if err := os.Mkdir(path, 0o700); err != nil { // makes os.Rename fail
 		t.Fatal(err)
 	}
-	if err := fsutil.WriteFile(path, []byte("new")); err == nil {
+	if err := fsutil.WriteFileAtomic(path, []byte("new")); err == nil {
 		t.Fatal("want error, got nil")
 	}
 }
 
 func TestWriteFileMissingParent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing", "data")
-	err := fsutil.WriteFile(path, []byte("x"))
+	err := fsutil.WriteFileAtomic(path, []byte("x"))
 	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("got %v, want ErrNotExist", err)
 	}
@@ -96,7 +96,7 @@ func TestWriteFileMissingParent(t *testing.T) {
 
 func TestPermissions(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "data")
-	if err := fsutil.WriteFile(path, []byte("x")); err != nil {
+	if err := fsutil.WriteFileAtomic(path, []byte("x")); err != nil {
 		t.Fatal(err)
 	}
 	info, err := os.Stat(path)

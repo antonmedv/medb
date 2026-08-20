@@ -1,8 +1,6 @@
 package medb
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,15 +9,15 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/antonmedv/medb/internal/lock"
-	"github.com/antonmedv/medb/internal/wal"
 )
 
 const (
 	walName  = "wal.log"
-	lockName = "LOCK"
+	lockName = "lock"
 )
 
 var (
@@ -63,8 +61,9 @@ func (o options) validate() error {
 }
 
 type DB struct {
-	dir  string
-	opts options
+	flock *os.File
+	dir   string
+	opts  options
 
 	mu      sync.RWMutex
 	colls   map[string]map[string]json.RawMessage
@@ -72,11 +71,18 @@ type DB struct {
 	dropped map[string]bool
 	closed  bool
 
-	log       *wal.Log
-	flock     *os.File
-	snapshotc chan struct{}
-	stop      chan struct{}
-	done      sync.WaitGroup
+	log     file
+	size    atomic.Int64
+	buf     []byte
+	pending []encodedRecord
+	spare   []encodedRecord
+	commit  *commit
+
+	snapshot chan struct{}
+	notify   chan struct{}
+	stop     chan struct{}
+	done     sync.WaitGroup
+	failed   error
 }
 
 func Open(dir string, opts ...Option) (*DB, error) {
@@ -98,25 +104,34 @@ func Open(dir string, opts ...Option) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	log, err := wal.Open(filepath.Join(dir, walName))
+	logPath := filepath.Join(dir, walName)
+	log, err := openLog(logPath)
 	if err != nil {
-		flock.Close()
+		_ = lock.Release(flock)
 		return nil, err
 	}
 	db := &DB{
-		dir:       filepath.Clean(dir),
-		opts:      o,
-		colls:     map[string]map[string]json.RawMessage{},
-		dirty:     map[string]bool{},
-		dropped:   map[string]bool{},
-		log:       log,
-		flock:     flock,
-		snapshotc: make(chan struct{}, 1),
-		stop:      make(chan struct{}),
+		flock:    flock,
+		dir:      filepath.Clean(dir),
+		opts:     o,
+		colls:    map[string]map[string]json.RawMessage{},
+		dirty:    map[string]bool{},
+		dropped:  map[string]bool{},
+		log:      log,
+		snapshot: make(chan struct{}, 1),
+		notify:   make(chan struct{}, 1),
+		stop:     make(chan struct{}),
 	}
 	if err := db.load(); err != nil {
-		log.Close()
-		flock.Close()
+		_ = lock.Release(flock)
+		return nil, err
+	}
+	if err := db.replayLog(logPath); err != nil {
+		_ = lock.Release(flock)
+		return nil, err
+	}
+	if err := db.writeSnapshot(nil); err != nil {
+		_ = lock.Release(flock)
 		return nil, err
 	}
 	db.done.Add(1)
@@ -133,14 +148,11 @@ func (db *DB) Close() error {
 	db.closed = true
 	db.mu.Unlock()
 
-	// The lock must be free here: the final flush runs on the flusher
-	// goroutine and takes db.mu, so waiting for it while holding the lock
-	// deadlocks.
 	close(db.stop)
 	db.done.Wait()
 
 	err := db.log.Close()
-	if e := db.flock.Close(); err == nil {
+	if e := lock.Release(db.flock); err == nil {
 		err = e
 	}
 
@@ -165,12 +177,24 @@ func (db *DB) Drop(name string) error {
 	// TODO: write WAL, wait for commit, apply
 }
 
-func NewID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic(err)
+func (db *DB) run() {
+	defer db.done.Done()
+	ticker := time.NewTicker(db.opts.flushInterval)
+	defer ticker.Stop()
+	var err error
+	for {
+		select {
+		case <-db.notify:
+			err = db.writeLog(err)
+		case <-db.snapshot:
+			err = db.writeSnapshot(err)
+		case <-ticker.C:
+			err = db.writeSnapshot(err)
+		case <-db.stop:
+			db.failed = db.writeSnapshot(err)
+			return
+		}
 	}
-	return hex.EncodeToString(b[:])
 }
 
 func (db *DB) writable() error {
@@ -189,10 +213,6 @@ func (db *DB) checkDocSize(raw []byte) error {
 
 func (db *DB) collPath(name string) string {
 	return filepath.Join(db.dir, filepath.FromSlash(name)+".json")
-}
-
-func (db *DB) walPath() string {
-	return filepath.Join(db.dir, walName)
 }
 
 func validName(name string) bool {

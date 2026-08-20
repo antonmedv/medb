@@ -18,3 +18,10 @@ func Acquire(path string) (*os.File, error) {
 	}
 	return f, nil
 }
+
+func Release(f *os.File) error {
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Remove(f.Name())
+}

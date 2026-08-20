@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 )
 
-func WriteFile(path string, data []byte) error {
+func WriteFileAtomic(path string, data []byte) error {
 	tmp := path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {

@@ -10,18 +10,19 @@ const (
 	opDrop = "drop"
 )
 
-type walRecord struct {
+type encodedRecord struct {
+	rec record
+	b   []byte
+}
+
+type record struct {
 	Op   string          `json:"op"`
 	Coll string          `json:"coll"`
 	ID   string          `json:"id,omitempty"`
 	Doc  json.RawMessage `json:"doc,omitempty"`
 }
 
-func encode(rec walRecord) ([]byte, error) {
-	return json.Marshal(rec)
-}
-
-func (db *DB) apply(rec walRecord) {
+func (db *DB) apply(rec record) {
 	switch rec.Op {
 	case opSet:
 		c := db.colls[rec.Coll]

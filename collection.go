@@ -51,15 +51,18 @@ func (c *Collection[T]) Set(id string, doc T) error {
 	if err := c.db.checkDocSize(raw); err != nil {
 		return err
 	}
-	rec := walRecord{Op: opSet, Coll: c.name, ID: id, Doc: raw}
-	// TODO: write WAL, wait for commit, apply
+	commit, err := c.db.enqueue(record{Op: opSet, Coll: c.name, ID: id, Doc: raw})
+	if err != nil {
+		return err
+	}
+	return commit.wait()
 }
 
 func (c *Collection[T]) Delete(id string) error {
 	if id == "" {
 		return errEmptyID
 	}
-	rec := walRecord{Op: opDel, Coll: c.name, ID: id}
+	rec := record{Op: opDel, Coll: c.name, ID: id}
 	// TODO: write WAL, wait for commit, apply
 }
 

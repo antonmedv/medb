@@ -2,47 +2,58 @@ package medb
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/antonmedv/medb/internal/fsutil"
-	"github.com/antonmedv/medb/internal/wal"
 )
 
-func (db *DB) run() {
-	defer db.done.Done()
-	ticker := time.NewTicker(db.opts.flushInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-db.flushc:
-			db.snapshot()
-		case <-ticker.C:
-			db.snapshot()
-		case <-db.stop:
-			db.snapshot()
-			return
+func (db *DB) writeSnapshot(err error) error {
+	if err != nil {
+		return err
+	}
+	db.mu.RLock()
+	for name := range db.dirty {
+		b, err := json.Marshal(db.colls[name])
+		if err != nil {
+			return err
+		}
+		if err := db.writeColl(name, b); err != nil {
+			return err
 		}
 	}
+	for name := range db.dropped {
+		if err := db.removeColl(name); err != nil {
+			return err
+		}
+	}
+	if err = db.log.Truncate(0); err == nil {
+		err = db.log.Sync()
+	}
+	if err == nil {
+		db.size.Store(0)
+	}
+	db.mu.RUnlock()
+	return nil
 }
 
-func (db *DB) snapshot() {
-	// TODO:
-}
-
-func (db *DB) removeSnapshot(name string) error {
+func (db *DB) writeColl(name string, data []byte) error {
 	path := db.collPath(name)
-	switch err := os.Remove(path); {
-	case errors.Is(err, fs.ErrNotExist):
-		// Dropped before its first flush: there is no file, and for a
-		// namespaced collection no parent directory to sync either.
-		return nil
-	case err != nil:
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	if err := fsutil.WriteFileAtomic(path, data); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (db *DB) removeColl(name string) error {
+	path := db.collPath(name)
+	if err := os.Remove(path); err != nil {
 		return err
 	}
 	return fsutil.SyncDir(filepath.Dir(path))
@@ -75,21 +86,5 @@ func (db *DB) load() error {
 	if err != nil {
 		return err
 	}
-	return db.replay()
-}
-
-func (db *DB) replay() error {
-	recs, err := wal.Records(db.walPath())
-	if err != nil {
-		return err
-	}
-	for i, payload := range recs {
-		var rec walRecord
-		if err := json.Unmarshal(payload, &rec); err != nil {
-			return fmt.Errorf("medb: corrupt wal record %d in %s: %w", i+1, db.walPath(), err)
-		}
-		db.apply(rec)
-	}
-	// TODO: we need to snapshot?
 	return nil
 }

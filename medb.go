@@ -152,7 +152,10 @@ func (db *DB) Close() error {
 	close(db.stop)
 	db.done.Wait()
 
-	err := db.log.Close()
+	err := db.failed
+	if e := db.log.Close(); err == nil {
+		err = e
+	}
 	if e := lock.Release(db.flock); err == nil {
 		err = e
 	}

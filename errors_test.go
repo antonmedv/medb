@@ -250,6 +250,35 @@ func TestUpdateCallbackError(t *testing.T) {
 	}
 }
 
+func TestUpdateCallbackPanicDoesNotWedgeDB(t *testing.T) {
+	db := openDB(t, t.TempDir())
+	users := medb.C[User](db, "users")
+	set(t, users, "u1", User{Name: "Ada"})
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("Update swallowed the callback panic")
+			}
+		}()
+		_ = users.Update("u1", func(User) (User, error) {
+			panic("boom")
+		})
+	}()
+
+	if got := get(t, users, "u1"); got.Name != "Ada" {
+		t.Fatalf("panicking Update mutated the document: %+v", got)
+	}
+	set(t, users, "u2", User{Name: "Grace"})
+	if err := users.Update("u1", func(u User) (User, error) {
+		u.Age++
+		return u, nil
+	}); err != nil {
+		t.Fatalf("Update after recovered panic: %v", err)
+	}
+	closeDB(t, db)
+}
+
 func TestSetMarshalError(t *testing.T) {
 	db := openDB(t, t.TempDir())
 	defer closeDB(t, db)

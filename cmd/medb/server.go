@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,62 +17,99 @@ import (
 	"github.com/antonmedv/medb"
 )
 
+// HTTP transport limits.
+//
+// readTimeout bounds a complete request read so a client which stalls part way
+// through a body cannot hold a connection open indefinitely, and writeTimeout
+// does the same for a response. A scan streams for as long as its client keeps
+// making progress: it extends its own write deadline before each record, so
+// writeTimeout bounds the gap between records rather than the whole stream.
+const (
+	readHeaderTimeout = 5 * time.Second
+	readTimeout       = 60 * time.Second
+	writeTimeout      = 60 * time.Second
+	idleTimeout       = 60 * time.Second
+	maxHeaderBytes    = 64 << 10
+)
+
 type route struct {
-	method   string
-	role     role
-	mutating bool
-	handler  func(http.ResponseWriter, *http.Request, principal)
+	method  string
+	role    role
+	handler func(http.ResponseWriter, *http.Request)
 }
 
 type apiServer struct {
-	db   *medb.DB
-	auth *authStore
-	cfg  serveConfig
+	db     *medb.DB
+	auth   *authStore
+	cfg    serveConfig
+	log    *slog.Logger
+	routes map[string]route
 
-	gate         sync.RWMutex
 	shuttingDown atomic.Bool
 	unavailable  atomic.Bool
 	failureOnce  sync.Once
 	failureCh    chan error
 }
 
-func newAPIServer(db *medb.DB, cfg serveConfig) *apiServer {
-	return &apiServer{
+func newAPIServer(db *medb.DB, cfg serveConfig, logger *slog.Logger) *apiServer {
+	s := &apiServer{
 		db:        db,
 		auth:      newAuthStore(db),
 		cfg:       cfg,
+		log:       logger,
 		failureCh: make(chan error, 1),
 	}
+	s.routes = s.buildRoutes()
+	return s
 }
 
-func (s *apiServer) routes() map[string]route {
+// buildRoutes returns the route table. The table depends only on configuration,
+// so it is built once and then read without synchronization.
+func (s *apiServer) buildRoutes() map[string]route {
 	routes := map[string]route{
 		"/v1/collections": {method: http.MethodGet, role: roleReader, handler: s.handleCollections},
 		"/v1/get":         {method: http.MethodPost, role: roleReader, handler: s.handleGet},
-		"/v1/set":         {method: http.MethodPost, role: roleWriter, mutating: true, handler: s.handleSet},
-		"/v1/delete":      {method: http.MethodPost, role: roleWriter, mutating: true, handler: s.handleDelete},
+		"/v1/set":         {method: http.MethodPost, role: roleWriter, handler: s.handleSet},
+		"/v1/delete":      {method: http.MethodPost, role: roleWriter, handler: s.handleDelete},
 		"/v1/has":         {method: http.MethodPost, role: roleReader, handler: s.handleHas},
 		"/v1/count":       {method: http.MethodPost, role: roleReader, handler: s.handleCount},
 		"/v1/scan":        {method: http.MethodPost, role: roleReader, handler: s.handleScan},
-		"/v1/drop":        {method: http.MethodPost, role: roleAdmin, mutating: true, handler: s.handleDrop},
+		"/v1/drop":        {method: http.MethodPost, role: roleAdmin, handler: s.handleDrop},
 	}
 	if s.cfg.noAuth {
 		return routes
 	}
 	routes["/v1/auth/users"] = route{method: http.MethodGet, role: roleAdmin, handler: s.handleUsers}
-	routes["/v1/auth/users/create"] = route{method: http.MethodPost, role: roleAdmin, mutating: true, handler: s.handleUserCreate}
-	routes["/v1/auth/users/update"] = route{method: http.MethodPost, role: roleAdmin, mutating: true, handler: s.handleUserUpdate}
-	routes["/v1/auth/tokens/create"] = route{method: http.MethodPost, role: roleAdmin, mutating: true, handler: s.handleTokenCreate}
+	routes["/v1/auth/users/create"] = route{method: http.MethodPost, role: roleAdmin, handler: s.handleUserCreate}
+	routes["/v1/auth/users/update"] = route{method: http.MethodPost, role: roleAdmin, handler: s.handleUserUpdate}
+	routes["/v1/auth/tokens/create"] = route{method: http.MethodPost, role: roleAdmin, handler: s.handleTokenCreate}
 	routes["/v1/auth/tokens/list"] = route{method: http.MethodPost, role: roleAdmin, handler: s.handleTokens}
-	routes["/v1/auth/tokens/revoke"] = route{method: http.MethodPost, role: roleAdmin, mutating: true, handler: s.handleTokenRevoke}
+	routes["/v1/auth/tokens/revoke"] = route{method: http.MethodPost, role: roleAdmin, handler: s.handleTokenRevoke}
 	return routes
 }
 
+// ServeHTTP dispatches one request. Handlers run concurrently; the server
+// relies on MeDB's own locking for thread safety and operation ordering, and
+// holds no lock of its own across a body read or a response write.
+//
+// Cache-Control is set here for every response the server produces.
 func (s *apiServer) ServeHTTP(base http.ResponseWriter, r *http.Request) {
 	w := &trackedResponseWriter{ResponseWriter: base}
 	w.Header().Set("Cache-Control", "no-store")
 	defer func() {
-		if recover() != nil && !w.wroteHeader {
+		value := recover()
+		if value == nil {
+			return
+		}
+		// A handler which aborts deliberately is not a server fault; let
+		// net/http drop the connection without a report.
+		if value == http.ErrAbortHandler {
+			panic(value)
+		}
+		s.log.Error("handler panic",
+			"method", r.Method, "path", r.URL.Path, "panic", fmt.Sprint(value),
+			"stack", string(debug.Stack()))
+		if !w.wroteHeader {
 			writeFailure(w, failInternal)
 		}
 	}()
@@ -79,28 +118,18 @@ func (s *apiServer) ServeHTTP(base http.ResponseWriter, r *http.Request) {
 		s.handleHealth(w, r)
 		return
 	}
-	underV1 := r.URL.Path == "/v1" || strings.HasPrefix(r.URL.Path, "/v1/")
-	if !underV1 {
+	if r.URL.Path != "/v1" && !strings.HasPrefix(r.URL.Path, "/v1/") {
 		writeFailure(w, failRouteNotFound)
 		return
 	}
-
-	routes := s.routes()
-	selected, exists := routes[r.URL.Path]
-	mutating := exists && selected.method == r.Method && selected.mutating
-	if mutating {
-		s.gate.Lock()
-		defer s.gate.Unlock()
-	} else {
-		s.gate.RLock()
-		defer s.gate.RUnlock()
-	}
-
 	if s.shuttingDown.Load() || s.unavailable.Load() {
 		writeFailure(w, failUnavailable)
 		return
 	}
-	actor := principal{role: roleAdmin}
+
+	// Authentication precedes route lookup so an unknown path under /v1 cannot
+	// be probed without a credential.
+	actor := roleAdmin
 	if !s.cfg.noAuth {
 		var authFailure *apiFailure
 		actor, authFailure = s.authenticateRequest(r)
@@ -109,6 +138,7 @@ func (s *apiServer) ServeHTTP(base http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	selected, exists := s.routes[r.URL.Path]
 	if !exists {
 		writeFailure(w, failRouteNotFound)
 		return
@@ -126,11 +156,11 @@ func (s *apiServer) ServeHTTP(base http.ResponseWriter, r *http.Request) {
 		writeFailure(w, failInvalidRequest)
 		return
 	}
-	if !roleAllows(actor.role, selected.role) {
+	if !roleAllows(actor, selected.role) {
 		writeFailure(w, failForbidden)
 		return
 	}
-	selected.handler(w, r, actor)
+	selected.handler(w, r)
 }
 
 func (s *apiServer) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -152,21 +182,21 @@ func (s *apiServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}{Status: "ok"})
 }
 
-func (s *apiServer) authenticateRequest(r *http.Request) (principal, *apiFailure) {
+func (s *apiServer) authenticateRequest(r *http.Request) (role, *apiFailure) {
 	values := r.Header.Values("Authorization")
 	if len(values) == 0 {
-		return principal{}, failAuthRequired
+		return "", failAuthRequired
 	}
 	if len(values) != 1 {
-		return principal{}, failInvalidToken
+		return "", failInvalidToken
 	}
 	parts := strings.Fields(values[0])
 	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
-		return principal{}, failInvalidToken
+		return "", failInvalidToken
 	}
 	actor, ok := s.auth.authenticate(parts[1], time.Now())
 	if !ok {
-		return principal{}, failInvalidToken
+		return "", failInvalidToken
 	}
 	return actor, nil
 }
@@ -174,11 +204,20 @@ func (s *apiServer) authenticateRequest(r *http.Request) (principal, *apiFailure
 func (s *apiServer) markStorageFailure(err error) {
 	s.failureOnce.Do(func() {
 		s.unavailable.Store(true)
+		s.log.Error("storage failure; server is shutting down", "error", err)
 		select {
 		case s.failureCh <- err:
 		default:
 		}
 	})
+}
+
+// internalError reports a server-side fault. The response carries no detail;
+// the cause is logged instead. Never pass a value derived from a credential or
+// a stored document.
+func (s *apiServer) internalError(w http.ResponseWriter, r *http.Request, err error) {
+	s.log.Error("internal error", "method", r.Method, "path", r.URL.Path, "error", err)
+	writeFailure(w, failInternal)
 }
 
 func (s *apiServer) mutationError(w http.ResponseWriter, err error) {
@@ -196,17 +235,27 @@ func (s *apiServer) mutationError(w http.ResponseWriter, err error) {
 	}
 }
 
-func prepareAuthentication(db *medb.DB, cfg serveConfig, getenv envLookup, stderr io.Writer) error {
+func newLogger(w io.Writer) *slog.Logger {
+	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelInfo}))
+}
+
+func prepareAuthentication(db *medb.DB, cfg serveConfig, getenv envLookup, logger *slog.Logger) error {
 	if cfg.noAuth {
-		_, _ = fmt.Fprintln(stderr, "medb: warning: authentication is disabled; all data endpoints are open")
+		logger.Warn("authentication is disabled; all data endpoints are open")
 		return nil
 	}
-	return initializeAuth(db, newAuthStore(db), getenv, stderr)
+	return initializeAuth(db, newAuthStore(db), getenv, logger)
 }
 
 type trackedResponseWriter struct {
 	http.ResponseWriter
 	wroteHeader bool
+}
+
+// Unwrap lets http.ResponseController reach the deadline and flush methods of
+// the writer underneath this one.
+func (w *trackedResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 func (w *trackedResponseWriter) WriteHeader(status int) {
@@ -233,7 +282,7 @@ func (w *trackedResponseWriter) Flush() {
 	}
 }
 
-func serve(ctx context.Context, cfg serveConfig, stderr io.Writer, getenv envLookup) (err error) {
+func serve(ctx context.Context, cfg serveConfig, logger *slog.Logger, getenv envLookup) (err error) {
 	db, err := medb.Open(cfg.dir,
 		medb.WithMaxDocSize(cfg.maxDocSize),
 		medb.WithFlushBytes(cfg.flushBytes),
@@ -251,7 +300,7 @@ func serve(ctx context.Context, cfg serveConfig, stderr io.Writer, getenv envLoo
 		}
 	}()
 
-	if err := prepareAuthentication(db, cfg, getenv, stderr); err != nil {
+	if err := prepareAuthentication(db, cfg, getenv, logger); err != nil {
 		return err
 	}
 	listener, err := net.Listen("tcp", cfg.listen)
@@ -259,18 +308,20 @@ func serve(ctx context.Context, cfg serveConfig, stderr io.Writer, getenv envLoo
 		return fmt.Errorf("medb: listen on %s: %w", cfg.listen, err)
 	}
 
-	api := newAPIServer(db, cfg)
+	api := newAPIServer(db, cfg, logger)
 	httpServer := &http.Server{
 		Handler:           api,
-		ReadHeaderTimeout: 5 * time.Second,
-		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    64 << 10,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
 	}
 	serveErr := make(chan error, 1)
 	go func() {
 		serveErr <- httpServer.Serve(listener)
 	}()
-	_, _ = fmt.Fprintf(stderr, "medb: listening on %s\n", listener.Addr())
+	logger.Info("listening", "address", listener.Addr().String())
 
 	var terminalErr error
 	select {

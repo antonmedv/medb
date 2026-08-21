@@ -62,15 +62,15 @@ func writeFailure(w http.ResponseWriter, f *apiFailure) {
 	writeJSON(w, f.status, errorEnvelope{Error: errorBody{Code: f.code, Message: f.message}})
 }
 
+// writeJSON and writeNoContent rely on [apiServer.ServeHTTP] having already set
+// Cache-Control on the response, which it does for every request it handles.
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
 }
 
 func writeNoContent(w http.ResponseWriter) {
-	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -218,9 +218,22 @@ func parseHex4(data []byte, start int) (uint16, bool) {
 	return value, true
 }
 
+// isJSONNull reports whether raw is the JSON literal null. Unmarshalling null
+// into a Go string or bool leaves the value untouched and reports no error, so
+// every required member has to reject it explicitly. Otherwise a null aliases
+// the zero value: a null "id" would silently mean the empty ID, and a null
+// "disabled" would silently mean false.
+func isJSONNull(raw json.RawMessage) bool {
+	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+}
+
 func stringField(fields map[string]json.RawMessage, name string) (string, *apiFailure) {
+	raw, ok := fields[name]
+	if !ok || isJSONNull(raw) {
+		return "", failInvalidRequest
+	}
 	var value string
-	if err := json.Unmarshal(fields[name], &value); err != nil {
+	if err := json.Unmarshal(raw, &value); err != nil {
 		return "", failInvalidRequest
 	}
 	return value, nil
@@ -228,7 +241,7 @@ func stringField(fields map[string]json.RawMessage, name string) (string, *apiFa
 
 func optionalStringField(fields map[string]json.RawMessage, name string) (*string, *apiFailure) {
 	raw, ok := fields[name]
-	if !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+	if !ok || isJSONNull(raw) {
 		return nil, nil
 	}
 	value, fail := stringField(fields, name)
@@ -243,6 +256,9 @@ func optionalBoolField(fields map[string]json.RawMessage, name string) (*bool, *
 	if !ok {
 		return nil, nil
 	}
+	if isJSONNull(raw) {
+		return nil, failInvalidRequest
+	}
 	var value bool
 	if err := json.Unmarshal(raw, &value); err != nil {
 		return nil, failInvalidRequest
@@ -250,6 +266,9 @@ func optionalBoolField(fields map[string]json.RawMessage, name string) (*bool, *
 	return &value, nil
 }
 
+// validCollectionName mirrors the grammar accepted by medb.C, which panics on an
+// invalid name. The two must stay in lockstep: anything accepted here is passed
+// straight to medb.C.
 func validCollectionName(name string) bool {
 	if len(name) == 0 || len(name) > 240 {
 		return false

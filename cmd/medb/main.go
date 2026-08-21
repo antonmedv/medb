@@ -38,7 +38,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, getenv en
 		if err != nil {
 			return err
 		}
-		return serve(ctx, cfg, stderr, getenv)
+		return serve(ctx, cfg, newLogger(stderr), getenv)
 	case "token":
 		if len(args) == 2 && args[1] == "generate" {
 			token, err := newToken()
@@ -56,7 +56,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, getenv en
 			if err != nil {
 				return err
 			}
-			return recoverAuth(cfg, stdout, stderr)
+			return recoverAuth(cfg, stdout, newLogger(stderr))
 		}
 		writeUsage(stderr)
 		return errors.New("medb: usage: medb auth recover --dir PATH --name NAME")

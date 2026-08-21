@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -58,7 +59,7 @@ func viewToken(id string, token tokenRecord) tokenView {
 	}
 }
 
-func (s *apiServer) handleCollections(w http.ResponseWriter, _ *http.Request, _ principal) {
+func (s *apiServer) handleCollections(w http.ResponseWriter, _ *http.Request) {
 	collections := make([]string, 0)
 	for _, name := range s.db.Collections() {
 		if !reservedCollection(name) {
@@ -70,7 +71,7 @@ func (s *apiServer) handleCollections(w http.ResponseWriter, _ *http.Request, _ 
 	}{Collections: collections})
 }
 
-func (s *apiServer) handleGet(w http.ResponseWriter, r *http.Request, _ principal) {
+func (s *apiServer) handleGet(w http.ResponseWriter, r *http.Request) {
 	fields, fail := readObject(w, r, s.cfg.maxRequestSize,
 		[]string{"collection", "id"}, []string{"collection", "id"})
 	if fail != nil {
@@ -89,13 +90,13 @@ func (s *apiServer) handleGet(w http.ResponseWriter, r *http.Request, _ principa
 	case errors.Is(err, medb.ErrClosed):
 		writeFailure(w, failUnavailable)
 	case err != nil:
-		writeFailure(w, failInternal)
+		s.internalError(w, r, fmt.Errorf("get %s: %w", collection, err))
 	default:
 		writeJSON(w, http.StatusOK, documentResponse{Document: document})
 	}
 }
 
-func (s *apiServer) handleSet(w http.ResponseWriter, r *http.Request, _ principal) {
+func (s *apiServer) handleSet(w http.ResponseWriter, r *http.Request) {
 	fields, fail := readObject(w, r, s.cfg.maxRequestSize,
 		[]string{"collection", "id", "document"}, []string{"collection", "id", "document"})
 	if fail != nil {
@@ -114,7 +115,7 @@ func (s *apiServer) handleSet(w http.ResponseWriter, r *http.Request, _ principa
 	writeNoContent(w)
 }
 
-func (s *apiServer) handleDelete(w http.ResponseWriter, r *http.Request, _ principal) {
+func (s *apiServer) handleDelete(w http.ResponseWriter, r *http.Request) {
 	fields, fail := readObject(w, r, s.cfg.maxRequestSize,
 		[]string{"collection", "id"}, []string{"collection", "id"})
 	if fail != nil {
@@ -133,7 +134,7 @@ func (s *apiServer) handleDelete(w http.ResponseWriter, r *http.Request, _ princ
 	writeNoContent(w)
 }
 
-func (s *apiServer) handleHas(w http.ResponseWriter, r *http.Request, _ principal) {
+func (s *apiServer) handleHas(w http.ResponseWriter, r *http.Request) {
 	fields, fail := readObject(w, r, s.cfg.maxRequestSize,
 		[]string{"collection", "id"}, []string{"collection", "id"})
 	if fail != nil {
@@ -150,7 +151,7 @@ func (s *apiServer) handleHas(w http.ResponseWriter, r *http.Request, _ principa
 	}{Exists: medb.C[json.RawMessage](s.db, collection).Has(id)})
 }
 
-func (s *apiServer) handleCount(w http.ResponseWriter, r *http.Request, _ principal) {
+func (s *apiServer) handleCount(w http.ResponseWriter, r *http.Request) {
 	fields, fail := readObject(w, r, s.cfg.maxRequestSize,
 		[]string{"collection"}, []string{"collection"})
 	if fail != nil {
@@ -167,7 +168,7 @@ func (s *apiServer) handleCount(w http.ResponseWriter, r *http.Request, _ princi
 	}{Count: medb.C[json.RawMessage](s.db, collection).Count()})
 }
 
-func (s *apiServer) handleScan(w http.ResponseWriter, r *http.Request, _ principal) {
+func (s *apiServer) handleScan(w http.ResponseWriter, r *http.Request) {
 	fields, fail := readObject(w, r, s.cfg.maxRequestSize,
 		[]string{"collection"}, []string{"collection"})
 	if fail != nil {
@@ -180,15 +181,21 @@ func (s *apiServer) handleScan(w http.ResponseWriter, r *http.Request, _ princip
 		return
 	}
 	w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	encoder := json.NewEncoder(w)
+	control := http.NewResponseController(w)
 	flusher, _ := w.(http.Flusher)
 	for id, document := range medb.C[json.RawMessage](s.db, collection).All() {
 		select {
 		case <-r.Context().Done():
 			return
 		default:
+		}
+		// Extend the deadline per record so the write timeout bounds the gap
+		// between records rather than the length of the whole stream.
+		if err := control.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil &&
+			!errors.Is(err, http.ErrNotSupported) {
+			return
 		}
 		if err := encoder.Encode(scanRecord{ID: id, Document: document}); err != nil {
 			return
@@ -199,7 +206,7 @@ func (s *apiServer) handleScan(w http.ResponseWriter, r *http.Request, _ princip
 	}
 }
 
-func (s *apiServer) handleDrop(w http.ResponseWriter, r *http.Request, _ principal) {
+func (s *apiServer) handleDrop(w http.ResponseWriter, r *http.Request) {
 	fields, fail := readObject(w, r, s.cfg.maxRequestSize,
 		[]string{"collection"}, []string{"collection"})
 	if fail != nil {
@@ -218,11 +225,11 @@ func (s *apiServer) handleDrop(w http.ResponseWriter, r *http.Request, _ princip
 	writeNoContent(w)
 }
 
-func (s *apiServer) handleUsers(w http.ResponseWriter, _ *http.Request, _ principal) {
+func (s *apiServer) handleUsers(w http.ResponseWriter, r *http.Request) {
 	users := make([]userView, 0)
 	for id, user := range s.auth.users.All() {
-		if validateUserRecord(id, user) != nil {
-			writeFailure(w, failInternal)
+		if err := validateUserRecord(id, user); err != nil {
+			s.internalError(w, r, fmt.Errorf("stored user %s: %w", id, err))
 			return
 		}
 		users = append(users, viewUser(id, user))
@@ -232,7 +239,7 @@ func (s *apiServer) handleUsers(w http.ResponseWriter, _ *http.Request, _ princi
 	}{Users: users})
 }
 
-func (s *apiServer) handleUserCreate(w http.ResponseWriter, r *http.Request, _ principal) {
+func (s *apiServer) handleUserCreate(w http.ResponseWriter, r *http.Request) {
 	fields, fail := readObject(w, r, s.cfg.maxRequestSize,
 		[]string{"name", "role"}, []string{"name", "role"})
 	if fail != nil {
@@ -262,7 +269,7 @@ func (s *apiServer) handleUserCreate(w http.ResponseWriter, r *http.Request, _ p
 	}{User: viewUser(id, user)})
 }
 
-func (s *apiServer) handleUserUpdate(w http.ResponseWriter, r *http.Request, _ principal) {
+func (s *apiServer) handleUserUpdate(w http.ResponseWriter, r *http.Request) {
 	fields, fail := readObject(w, r, s.cfg.maxRequestSize,
 		[]string{"user_id", "role", "disabled"}, []string{"user_id"})
 	if fail != nil {
@@ -290,8 +297,8 @@ func (s *apiServer) handleUserUpdate(w http.ResponseWriter, r *http.Request, _ p
 		return
 	}
 	err := s.auth.users.Update(uid, func(user userRecord) (userRecord, error) {
-		if validateUserRecord(uid, user) != nil {
-			return user, errMalformedAuthRecord
+		if err := validateUserRecord(uid, user); err != nil {
+			return user, fmt.Errorf("%w: %w", errMalformedAuthRecord, err)
 		}
 		if newRole != nil {
 			user.Role = *newRole
@@ -307,7 +314,7 @@ func (s *apiServer) handleUserUpdate(w http.ResponseWriter, r *http.Request, _ p
 		writeFailure(w, failNotFound)
 		return
 	case errors.Is(err, errMalformedAuthRecord):
-		writeFailure(w, failInternal)
+		s.internalError(w, r, err)
 		return
 	case err != nil:
 		s.mutationError(w, err)
@@ -315,7 +322,7 @@ func (s *apiServer) handleUserUpdate(w http.ResponseWriter, r *http.Request, _ p
 	}
 	user, err := s.auth.users.Get(uid)
 	if err != nil {
-		writeFailure(w, failInternal)
+		s.internalError(w, r, fmt.Errorf("reread user %s: %w", uid, err))
 		return
 	}
 	writeJSON(w, http.StatusOK, struct {
@@ -323,7 +330,7 @@ func (s *apiServer) handleUserUpdate(w http.ResponseWriter, r *http.Request, _ p
 	}{User: viewUser(uid, user)})
 }
 
-func (s *apiServer) handleTokenCreate(w http.ResponseWriter, r *http.Request, _ principal) {
+func (s *apiServer) handleTokenCreate(w http.ResponseWriter, r *http.Request) {
 	fields, fail := readObject(w, r, s.cfg.maxRequestSize,
 		[]string{"user_id", "label", "expires_at"}, []string{"user_id", "label"})
 	if fail != nil {
@@ -345,10 +352,15 @@ func (s *apiServer) handleTokenCreate(w http.ResponseWriter, r *http.Request, _ 
 	case errors.Is(err, medb.ErrNotFound):
 		writeFailure(w, failNotFound)
 		return
-	case err != nil || validateUserRecord(uid, user) != nil:
-		writeFailure(w, failInternal)
+	case err != nil:
+		s.internalError(w, r, fmt.Errorf("read user %s: %w", uid, err))
 		return
-	case user.Disabled:
+	}
+	if err := validateUserRecord(uid, user); err != nil {
+		s.internalError(w, r, fmt.Errorf("stored user %s: %w", uid, err))
+		return
+	}
+	if user.Disabled {
 		writeFailure(w, failUserDisabled)
 		return
 	}
@@ -371,7 +383,7 @@ func (s *apiServer) handleTokenCreate(w http.ResponseWriter, r *http.Request, _ 
 	}
 	token, tid, err := uniqueToken(s.auth.tokens)
 	if err != nil {
-		writeFailure(w, failInternal)
+		s.internalError(w, r, fmt.Errorf("generate token: %w", err))
 		return
 	}
 	record := tokenRecord{UserID: uid, Label: label, CreatedAt: createdAt, ExpiresAt: expiresAt}
@@ -392,7 +404,7 @@ func (s *apiServer) handleTokenCreate(w http.ResponseWriter, r *http.Request, _ 
 	})
 }
 
-func (s *apiServer) handleTokens(w http.ResponseWriter, r *http.Request, _ principal) {
+func (s *apiServer) handleTokens(w http.ResponseWriter, r *http.Request) {
 	fields, fail := readObject(w, r, s.cfg.maxRequestSize,
 		[]string{"user_id"}, []string{"user_id"})
 	if fail != nil {
@@ -409,14 +421,18 @@ func (s *apiServer) handleTokens(w http.ResponseWriter, r *http.Request, _ princ
 		writeFailure(w, failNotFound)
 		return
 	}
-	if err != nil || validateUserRecord(uid, user) != nil {
-		writeFailure(w, failInternal)
+	if err != nil {
+		s.internalError(w, r, fmt.Errorf("read user %s: %w", uid, err))
+		return
+	}
+	if err := validateUserRecord(uid, user); err != nil {
+		s.internalError(w, r, fmt.Errorf("stored user %s: %w", uid, err))
 		return
 	}
 	tokens := make([]tokenView, 0)
 	for tid, token := range s.auth.tokens.All() {
-		if validateTokenRecord(tid, token) != nil {
-			writeFailure(w, failInternal)
+		if err := validateTokenRecord(tid, token); err != nil {
+			s.internalError(w, r, fmt.Errorf("stored token %s: %w", tid, err))
 			return
 		}
 		if token.UserID == uid {
@@ -428,7 +444,7 @@ func (s *apiServer) handleTokens(w http.ResponseWriter, r *http.Request, _ princ
 	}{Tokens: tokens})
 }
 
-func (s *apiServer) handleTokenRevoke(w http.ResponseWriter, r *http.Request, _ principal) {
+func (s *apiServer) handleTokenRevoke(w http.ResponseWriter, r *http.Request) {
 	fields, fail := readObject(w, r, s.cfg.maxRequestSize,
 		[]string{"token_id"}, []string{"token_id"})
 	if fail != nil {

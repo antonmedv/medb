@@ -17,8 +17,8 @@ go install github.com/antonmedv/medb/cmd/medb@latest
 Generate the initial administrator token once and keep the file private:
 
 ```sh
-umask 077
 medb token generate > admin-token
+chmod 600 admin-token
 
 MEDB_INIT_ADMIN_TOKEN_FILE="$PWD/admin-token" \
   medb serve --dir ./data
@@ -27,7 +27,7 @@ MEDB_INIT_ADMIN_TOKEN_FILE="$PWD/admin-token" \
 The server listens on `127.0.0.1:8080` by default. In another shell:
 
 ```sh
-TOKEN="$(tr -d '\r\n' < admin-token)"
+TOKEN="$(cat admin-token)"
 
 curl -sS http://127.0.0.1:8080/v1/set \
   -H "Authorization: Bearer $TOKEN" \

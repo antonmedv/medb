@@ -57,10 +57,10 @@ func newTestAPI(t *testing.T) (*apiServer, *medb.DB, string) {
 		"MEDB_INIT_ADMIN_TOKEN": token,
 	}
 	auth := newAuthStore(db)
-	if err := initializeAuth(db, auth, env.lookup, &bytes.Buffer{}); err != nil {
+	if err := initializeAuth(db, auth, env.lookup, newLogger(&bytes.Buffer{})); err != nil {
 		t.Fatal(err)
 	}
-	return newAPIServer(db, testServeConfig(dir)), db, token
+	return newAPIServer(db, testServeConfig(dir), newLogger(&bytes.Buffer{})), db, token
 }
 
 func callRaw(t *testing.T, api http.Handler, token, method, path, body string) *httptest.ResponseRecorder {
@@ -201,7 +201,7 @@ func TestNoAuthModeOpensDataRoutesAndHidesAuthManagement(t *testing.T) {
 	var stderr bytes.Buffer
 	if err := prepareAuthentication(db, cfg, envMap{
 		"MEDB_INIT_ADMIN_TOKEN_FILE": "/missing/secret",
-	}.lookup, &stderr); err != nil {
+	}.lookup, newLogger(&stderr)); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(stderr.String(), "authentication is disabled") {
@@ -211,7 +211,7 @@ func TestNoAuthModeOpensDataRoutesAndHidesAuthManagement(t *testing.T) {
 		t.Fatalf("no-auth mode initialized authentication state: %v", err)
 	}
 
-	api := newAPIServer(db, cfg)
+	api := newAPIServer(db, cfg, newLogger(&bytes.Buffer{}))
 	response := callRaw(t, api, "not-a-token", http.MethodPost, "/v1/set",
 		`{"collection":"docs","id":"open/id","document":true}`)
 	if response.Code != http.StatusNoContent {
@@ -357,7 +357,7 @@ func TestInitializationFromSecretFileAndIgnoredAfterward(t *testing.T) {
 		"MEDB_INIT_ADMIN_NAME":       "container-admin",
 		"MEDB_INIT_ADMIN_TOKEN_FILE": secretPath,
 	}
-	if err := initializeAuth(db, newAuthStore(db), env.lookup, &bytes.Buffer{}); err != nil {
+	if err := initializeAuth(db, newAuthStore(db), env.lookup, newLogger(&bytes.Buffer{})); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -373,7 +373,7 @@ func TestInitializationFromSecretFileAndIgnoredAfterward(t *testing.T) {
 	}
 	defer db.Close()
 	var stderr bytes.Buffer
-	if err := initializeAuth(db, newAuthStore(db), env.lookup, &stderr); err != nil {
+	if err := initializeAuth(db, newAuthStore(db), env.lookup, newLogger(&stderr)); err != nil {
 		t.Fatalf("initialized database read removed secret: %v", err)
 	}
 	if !strings.Contains(stderr.String(), "ignored") {
@@ -412,7 +412,7 @@ func TestInitializationResumesAfterTokenWrite(t *testing.T) {
 	defer db.Close()
 	env := envMap{"MEDB_INIT_ADMIN_NAME": "resumed", "MEDB_INIT_ADMIN_TOKEN": token}
 	auth = newAuthStore(db)
-	if err := initializeAuth(db, auth, env.lookup, &bytes.Buffer{}); err != nil {
+	if err := initializeAuth(db, auth, env.lookup, newLogger(&bytes.Buffer{})); err != nil {
 		t.Fatal(err)
 	}
 	state, err := auth.state.Get(stateID)
@@ -436,7 +436,7 @@ func TestTokenGenerateAndOfflineRecovery(t *testing.T) {
 	dir := t.TempDir()
 	stdout.Reset()
 	stderr.Reset()
-	if err := recoverAuth(recoverConfig{dir: dir, name: "recovered"}, &stdout, &stderr); err != nil {
+	if err := recoverAuth(recoverConfig{dir: dir, name: "recovered"}, &stdout, newLogger(&stderr)); err != nil {
 		t.Fatal(err)
 	}
 	values := map[string]string{}
@@ -467,13 +467,13 @@ func TestServeConfigEnvironmentAndFlagPrecedence(t *testing.T) {
 		"MEDB_NO_AUTH":          "true",
 		"MEDB_MAX_DOC_SIZE":     "bad",
 		"MEDB_FLUSH_INTERVAL":   "2s",
-		"MEDB_MAX_REQUEST_SIZE": "99",
+		"MEDB_MAX_REQUEST_SIZE": "9999",
 	}
 	cfg, err := parseServeConfig([]string{"--dir", "/flag/data", "--max-doc-size", "123"}, &bytes.Buffer{}, env.lookup)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.dir != "/flag/data" || cfg.listen != "127.0.0.1:9000" || !cfg.noAuth || cfg.maxDocSize != 123 || cfg.flushInterval != 2*time.Second || cfg.maxRequestSize != 99 {
+	if cfg.dir != "/flag/data" || cfg.listen != "127.0.0.1:9000" || !cfg.noAuth || cfg.maxDocSize != 123 || cfg.flushInterval != 2*time.Second || cfg.maxRequestSize != 9999 {
 		t.Fatalf("unexpected config: %+v", cfg)
 	}
 	overridden, err := parseServeConfig([]string{

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"slices"
 	"strings"
@@ -50,12 +51,6 @@ type tokenRecord struct {
 	Label     string  `json:"label"`
 	CreatedAt string  `json:"created_at"`
 	ExpiresAt *string `json:"expires_at"`
-}
-
-type principal struct {
-	userID string
-	name   string
-	role   role
 }
 
 type authStore struct {
@@ -207,26 +202,29 @@ func validateStateRecord(state stateRecord) error {
 	return nil
 }
 
-func (a *authStore) authenticate(token string, now time.Time) (principal, bool) {
+// authenticate resolves a bearer token to the role it currently grants. It
+// fails closed: a malformed record, an expired token, an unknown or disabled
+// user, and an unknown role all report false.
+func (a *authStore) authenticate(token string, now time.Time) (role, bool) {
 	if !validToken(token) {
-		return principal{}, false
+		return "", false
 	}
 	tid := tokenID(token)
 	record, err := a.tokens.Get(tid)
 	if err != nil || validateTokenRecord(tid, record) != nil {
-		return principal{}, false
+		return "", false
 	}
 	if record.ExpiresAt != nil {
 		expires, err := parseUTCTimestamp(*record.ExpiresAt)
 		if err != nil || !now.Before(expires) {
-			return principal{}, false
+			return "", false
 		}
 	}
 	user, err := a.users.Get(record.UserID)
 	if err != nil || validateUserRecord(record.UserID, user) != nil || user.Disabled {
-		return principal{}, false
+		return "", false
 	}
-	return principal{userID: record.UserID, name: user.Name, role: user.Role}, true
+	return user.Role, true
 }
 
 func (a *authStore) hasActiveAdmin(now time.Time) (ok bool, err error) {
@@ -257,7 +255,7 @@ func (a *authStore) hasActiveAdmin(now time.Time) (ok bool, err error) {
 	return false, nil
 }
 
-func initializeAuth(db *medb.DB, auth *authStore, getenv envLookup, stderr io.Writer) error {
+func initializeAuth(db *medb.DB, auth *authStore, getenv envLookup, logger *slog.Logger) error {
 	state, err := auth.state.Get(stateID)
 	switch {
 	case err == nil:
@@ -265,7 +263,7 @@ func initializeAuth(db *medb.DB, auth *authStore, getenv envLookup, stderr io.Wr
 			return fmt.Errorf("medb: invalid authentication state: %w", err)
 		}
 		if initEnvironmentPresent(getenv) {
-			_, _ = fmt.Fprintln(stderr, "medb: authentication already initialized; MEDB_INIT_* values ignored")
+			logger.Info("authentication already initialized; MEDB_INIT_* values ignored")
 		}
 		ok, err := auth.hasActiveAdmin(time.Now())
 		if err != nil {
@@ -283,7 +281,7 @@ func initializeAuth(db *medb.DB, auth *authStore, getenv envLookup, stderr io.Wr
 		return errors.New("medb: authentication state marker is missing but _meta/state is not empty")
 	}
 	for _, name := range db.Collections() {
-		if (name == "_meta" || strings.HasPrefix(name, "_meta/")) &&
+		if reservedCollection(name) &&
 			!slices.Contains([]string{stateCollection, userCollection, tokenCollection}, name) {
 			return fmt.Errorf("medb: reserved collection %q conflicts with server metadata", name)
 		}
@@ -416,8 +414,8 @@ func uniqueToken(tokens *medb.Collection[tokenRecord]) (token, id string, err er
 	}
 }
 
-func recoverAuth(cfg recoverConfig, stdout, stderr io.Writer) (err error) {
-	_, _ = fmt.Fprintln(stderr, "medb: warning: creating a new offline administrator credential")
+func recoverAuth(cfg recoverConfig, stdout io.Writer, logger *slog.Logger) (err error) {
+	logger.Warn("creating a new offline administrator credential")
 	db, err := medb.Open(cfg.dir)
 	if err != nil {
 		return err

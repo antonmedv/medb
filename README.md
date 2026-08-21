@@ -12,6 +12,8 @@ That is how this database was born. MeDB is a small embedded in memory database 
 3. Only one process can open the database at a time.
 4. Concurrent reads/writes are safe.
 
+The optional [MeDB server](cmd/medb/README.md) exposes the database over HTTP with JSON, token authentication, and roles.
+
 ## Usage
 
 ```go

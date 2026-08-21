@@ -116,6 +116,13 @@ func Open(dir string, opts ...Option) (*DB, error) {
 		flock.Close()
 		return nil, err
 	}
+	ok := false
+	defer func() {
+		if !ok {
+			log.Close()
+			flock.Close()
+		}
+	}()
 	db := &DB{
 		flock:   flock,
 		dir:     dir,
@@ -128,19 +135,17 @@ func Open(dir string, opts ...Option) (*DB, error) {
 		stop:    make(chan struct{}),
 	}
 	if err := db.load(); err != nil {
-		flock.Close()
 		return nil, err
 	}
 	if err := db.replayLog(logPath); err != nil {
-		flock.Close()
 		return nil, err
 	}
 	if err := db.writeSnapshot(nil); err != nil {
-		flock.Close()
 		return nil, err
 	}
 	db.done.Add(1)
 	go db.run()
+	ok = true
 	return db, nil
 }
 

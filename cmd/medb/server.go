@@ -44,22 +44,26 @@ func newAPIServer(db *medb.DB, cfg serveConfig) *apiServer {
 }
 
 func (s *apiServer) routes() map[string]route {
-	return map[string]route{
-		"/v1/collections":        {method: http.MethodGet, role: roleReader, handler: s.handleCollections},
-		"/v1/get":                {method: http.MethodPost, role: roleReader, handler: s.handleGet},
-		"/v1/set":                {method: http.MethodPost, role: roleWriter, mutating: true, handler: s.handleSet},
-		"/v1/delete":             {method: http.MethodPost, role: roleWriter, mutating: true, handler: s.handleDelete},
-		"/v1/has":                {method: http.MethodPost, role: roleReader, handler: s.handleHas},
-		"/v1/count":              {method: http.MethodPost, role: roleReader, handler: s.handleCount},
-		"/v1/scan":               {method: http.MethodPost, role: roleReader, handler: s.handleScan},
-		"/v1/drop":               {method: http.MethodPost, role: roleAdmin, mutating: true, handler: s.handleDrop},
-		"/v1/auth/users":         {method: http.MethodGet, role: roleAdmin, handler: s.handleUsers},
-		"/v1/auth/users/create":  {method: http.MethodPost, role: roleAdmin, mutating: true, handler: s.handleUserCreate},
-		"/v1/auth/users/update":  {method: http.MethodPost, role: roleAdmin, mutating: true, handler: s.handleUserUpdate},
-		"/v1/auth/tokens/create": {method: http.MethodPost, role: roleAdmin, mutating: true, handler: s.handleTokenCreate},
-		"/v1/auth/tokens/list":   {method: http.MethodPost, role: roleAdmin, handler: s.handleTokens},
-		"/v1/auth/tokens/revoke": {method: http.MethodPost, role: roleAdmin, mutating: true, handler: s.handleTokenRevoke},
+	routes := map[string]route{
+		"/v1/collections": {method: http.MethodGet, role: roleReader, handler: s.handleCollections},
+		"/v1/get":         {method: http.MethodPost, role: roleReader, handler: s.handleGet},
+		"/v1/set":         {method: http.MethodPost, role: roleWriter, mutating: true, handler: s.handleSet},
+		"/v1/delete":      {method: http.MethodPost, role: roleWriter, mutating: true, handler: s.handleDelete},
+		"/v1/has":         {method: http.MethodPost, role: roleReader, handler: s.handleHas},
+		"/v1/count":       {method: http.MethodPost, role: roleReader, handler: s.handleCount},
+		"/v1/scan":        {method: http.MethodPost, role: roleReader, handler: s.handleScan},
+		"/v1/drop":        {method: http.MethodPost, role: roleAdmin, mutating: true, handler: s.handleDrop},
 	}
+	if s.cfg.noAuth {
+		return routes
+	}
+	routes["/v1/auth/users"] = route{method: http.MethodGet, role: roleAdmin, handler: s.handleUsers}
+	routes["/v1/auth/users/create"] = route{method: http.MethodPost, role: roleAdmin, mutating: true, handler: s.handleUserCreate}
+	routes["/v1/auth/users/update"] = route{method: http.MethodPost, role: roleAdmin, mutating: true, handler: s.handleUserUpdate}
+	routes["/v1/auth/tokens/create"] = route{method: http.MethodPost, role: roleAdmin, mutating: true, handler: s.handleTokenCreate}
+	routes["/v1/auth/tokens/list"] = route{method: http.MethodPost, role: roleAdmin, handler: s.handleTokens}
+	routes["/v1/auth/tokens/revoke"] = route{method: http.MethodPost, role: roleAdmin, mutating: true, handler: s.handleTokenRevoke}
+	return routes
 }
 
 func (s *apiServer) ServeHTTP(base http.ResponseWriter, r *http.Request) {
@@ -96,10 +100,14 @@ func (s *apiServer) ServeHTTP(base http.ResponseWriter, r *http.Request) {
 		writeFailure(w, failUnavailable)
 		return
 	}
-	actor, authFailure := s.authenticateRequest(r)
-	if authFailure != nil {
-		writeFailure(w, authFailure)
-		return
+	actor := principal{role: roleAdmin}
+	if !s.cfg.noAuth {
+		var authFailure *apiFailure
+		actor, authFailure = s.authenticateRequest(r)
+		if authFailure != nil {
+			writeFailure(w, authFailure)
+			return
+		}
 	}
 	if !exists {
 		writeFailure(w, failRouteNotFound)
@@ -188,6 +196,14 @@ func (s *apiServer) mutationError(w http.ResponseWriter, err error) {
 	}
 }
 
+func prepareAuthentication(db *medb.DB, cfg serveConfig, getenv envLookup, stderr io.Writer) error {
+	if cfg.noAuth {
+		_, _ = fmt.Fprintln(stderr, "medb: warning: authentication is disabled; all data endpoints are open")
+		return nil
+	}
+	return initializeAuth(db, newAuthStore(db), getenv, stderr)
+}
+
 type trackedResponseWriter struct {
 	http.ResponseWriter
 	wroteHeader bool
@@ -235,8 +251,7 @@ func serve(ctx context.Context, cfg serveConfig, stderr io.Writer, getenv envLoo
 		}
 	}()
 
-	auth := newAuthStore(db)
-	if err := initializeAuth(db, auth, getenv, stderr); err != nil {
+	if err := prepareAuthentication(db, cfg, getenv, stderr); err != nil {
 		return err
 	}
 	listener, err := net.Listen("tcp", cfg.listen)

@@ -22,6 +22,7 @@ const (
 type serveConfig struct {
 	dir             string
 	listen          string
+	noAuth          bool
 	maxDocSize      int
 	flushBytes      int64
 	flushInterval   time.Duration
@@ -42,6 +43,7 @@ func parseServeConfig(args []string, stderr io.Writer, getenv envLookup) (serveC
 
 	dirDefault := envString(getenv, "MEDB_DIR", "")
 	listenDefault := envString(getenv, "MEDB_LISTEN", defaultListen)
+	noAuthDefault := envString(getenv, "MEDB_NO_AUTH", "false")
 	maxDocDefault := envString(getenv, "MEDB_MAX_DOC_SIZE", strconv.Itoa(defaultMaxDocSize))
 	flushBytesDefault := envString(getenv, "MEDB_FLUSH_BYTES", strconv.FormatInt(defaultFlushBytes, 10))
 	flushIntervalDefault := envString(getenv, "MEDB_FLUSH_INTERVAL", defaultFlushInterval.String())
@@ -50,8 +52,10 @@ func parseServeConfig(args []string, stderr io.Writer, getenv envLookup) (serveC
 	shutdownDefault := envString(getenv, "MEDB_SHUTDOWN_TIMEOUT", defaultShutdownTimeout.String())
 
 	var maxDoc, flushBytes, flushInterval, maxID, maxRequest, shutdown string
+	noAuth := boolFlagValue{raw: noAuthDefault}
 	fs.StringVar(&cfg.dir, "dir", dirDefault, "MeDB database directory")
 	fs.StringVar(&cfg.listen, "listen", listenDefault, "HTTP listen address")
+	fs.Var(&noAuth, "no-auth", "disable bearer authentication")
 	fs.StringVar(&maxDoc, "max-doc-size", maxDocDefault, "maximum encoded document bytes")
 	fs.StringVar(&flushBytes, "flush-bytes", flushBytesDefault, "WAL bytes which trigger a snapshot")
 	fs.StringVar(&flushInterval, "flush-interval", flushIntervalDefault, "snapshot interval")
@@ -72,6 +76,9 @@ func parseServeConfig(args []string, stderr io.Writer, getenv envLookup) (serveC
 	}
 
 	var err error
+	if cfg.noAuth, err = parseBool("no auth", noAuth.raw); err != nil {
+		return cfg, err
+	}
 	if cfg.maxDocSize, err = parsePositiveInt("max document size", maxDoc); err != nil {
 		return cfg, err
 	}
@@ -91,6 +98,27 @@ func parseServeConfig(args []string, stderr io.Writer, getenv envLookup) (serveC
 		return cfg, err
 	}
 	return cfg, nil
+}
+
+type boolFlagValue struct {
+	raw string
+}
+
+func (v *boolFlagValue) String() string {
+	return v.raw
+}
+
+func (v *boolFlagValue) Set(value string) error {
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return err
+	}
+	v.raw = strconv.FormatBool(parsed)
+	return nil
+}
+
+func (*boolFlagValue) IsBoolFlag() bool {
+	return true
 }
 
 func parseRecoverConfig(args []string, stderr io.Writer) (recoverConfig, error) {
@@ -143,4 +171,12 @@ func parsePositiveDuration(name, value string) (time.Duration, error) {
 		return 0, fmt.Errorf("medb: %s must be a positive Go duration, got %q", name, value)
 	}
 	return d, nil
+}
+
+func parseBool(name, value string) (bool, error) {
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("medb: %s must be a Go boolean, got %q", name, value)
+	}
+	return parsed, nil
 }

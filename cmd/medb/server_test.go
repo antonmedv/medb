@@ -185,6 +185,54 @@ func TestCollectionsHideMetadataAndNullDocument(t *testing.T) {
 	}
 }
 
+func TestNoAuthModeOpensDataRoutesAndHidesAuthManagement(t *testing.T) {
+	dir := t.TempDir()
+	db, err := medb.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil && !errors.Is(err, medb.ErrClosed) {
+			t.Errorf("close database: %v", err)
+		}
+	})
+	cfg := testServeConfig(dir)
+	cfg.noAuth = true
+	var stderr bytes.Buffer
+	if err := prepareAuthentication(db, cfg, envMap{
+		"MEDB_INIT_ADMIN_TOKEN_FILE": "/missing/secret",
+	}.lookup, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr.String(), "authentication is disabled") {
+		t.Fatalf("missing no-auth warning: %q", stderr.String())
+	}
+	if _, err := newAuthStore(db).state.Get(stateID); !errors.Is(err, medb.ErrNotFound) {
+		t.Fatalf("no-auth mode initialized authentication state: %v", err)
+	}
+
+	api := newAPIServer(db, cfg)
+	response := callRaw(t, api, "not-a-token", http.MethodPost, "/v1/set",
+		`{"collection":"docs","id":"open/id","document":true}`)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("unauthenticated set: status %d, body %s", response.Code, response.Body.String())
+	}
+	response = callJSON(t, api, "", http.MethodPost, "/v1/drop", map[string]any{"collection": "docs"})
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("unauthenticated drop: status %d, body %s", response.Code, response.Body.String())
+	}
+	response = callJSON(t, api, "", http.MethodGet, "/v1/auth/users", nil)
+	if response.Code != http.StatusNotFound || responseCode(t, response) != "route_not_found" {
+		t.Fatalf("auth route: status %d, body %s", response.Code, response.Body.String())
+	}
+	response = callJSON(t, api, "", http.MethodPost, "/v1/get", map[string]any{
+		"collection": "_meta/users", "id": "x",
+	})
+	if response.Code != http.StatusForbidden || responseCode(t, response) != "reserved_collection" {
+		t.Fatalf("reserved collection: status %d, body %s", response.Code, response.Body.String())
+	}
+}
+
 func TestAuthenticationRolesAndRevocation(t *testing.T) {
 	api, _, adminToken := newTestAPI(t)
 	response := callJSON(t, api, adminToken, http.MethodPost, "/v1/auth/users/create", map[string]any{
@@ -416,6 +464,7 @@ func TestServeConfigEnvironmentAndFlagPrecedence(t *testing.T) {
 	env := envMap{
 		"MEDB_DIR":              "/env/data",
 		"MEDB_LISTEN":           "127.0.0.1:9000",
+		"MEDB_NO_AUTH":          "true",
 		"MEDB_MAX_DOC_SIZE":     "bad",
 		"MEDB_FLUSH_INTERVAL":   "2s",
 		"MEDB_MAX_REQUEST_SIZE": "99",
@@ -424,13 +473,35 @@ func TestServeConfigEnvironmentAndFlagPrecedence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.dir != "/flag/data" || cfg.listen != "127.0.0.1:9000" || cfg.maxDocSize != 123 || cfg.flushInterval != 2*time.Second || cfg.maxRequestSize != 99 {
+	if cfg.dir != "/flag/data" || cfg.listen != "127.0.0.1:9000" || !cfg.noAuth || cfg.maxDocSize != 123 || cfg.flushInterval != 2*time.Second || cfg.maxRequestSize != 99 {
 		t.Fatalf("unexpected config: %+v", cfg)
+	}
+	overridden, err := parseServeConfig([]string{
+		"--dir", "/flag/data", "--max-doc-size", "123", "--no-auth=false",
+	}, &bytes.Buffer{}, env.lookup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if overridden.noAuth {
+		t.Fatal("--no-auth=false did not override MEDB_NO_AUTH=true")
+	}
+	enabled, err := parseServeConfig([]string{"--dir", "/flag/data", "--no-auth"}, &bytes.Buffer{}, envMap{}.lookup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !enabled.noAuth {
+		t.Fatal("bare --no-auth did not enable unauthenticated mode")
 	}
 
 	_, err = parseServeConfig(nil, &bytes.Buffer{}, env.lookup)
 	if err == nil || !strings.Contains(err.Error(), "max document size") {
 		t.Fatalf("invalid environment error = %v", err)
+	}
+	_, err = parseServeConfig(nil, &bytes.Buffer{}, envMap{
+		"MEDB_DIR": "/env/data", "MEDB_NO_AUTH": "sometimes",
+	}.lookup)
+	if err == nil || !strings.Contains(err.Error(), "Go boolean") {
+		t.Fatalf("invalid no-auth environment error = %v", err)
 	}
 }
 

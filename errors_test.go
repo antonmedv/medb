@@ -212,6 +212,30 @@ func TestUnusualValidNames(t *testing.T) {
 	}
 }
 
+func TestDocumentedCollectionNames(t *testing.T) {
+	names := []string{
+		"users",
+		"audit-log",
+		"user_profiles",
+		"2026/events",
+		"prod/eu/users",
+	}
+	dir := t.TempDir()
+	db := openDB(t, dir)
+	for _, name := range names {
+		set(t, medb.C[string](db, name), "id", name)
+	}
+	closeDB(t, db)
+
+	db = openDB(t, dir)
+	defer closeDB(t, db)
+	for _, name := range names {
+		if got := get(t, medb.C[string](db, name), "id"); got != name {
+			t.Fatalf("collection %q: got %q", name, got)
+		}
+	}
+}
+
 func TestUpdateMissing(t *testing.T) {
 	db := openDB(t, t.TempDir())
 	defer closeDB(t, db)

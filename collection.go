@@ -22,6 +22,9 @@ type Collection[T any] struct {
 // A name may contain lowercase ASCII letters, digits, hyphens, underscores,
 // and slash-separated path segments. It must not exceed 240 bytes. C panics if
 // the name is invalid. Document IDs may contain any string.
+//
+// Valid names include "users", "audit-log", "user_profiles", "2026/events",
+// and "prod/eu/users".
 func C[T any](db *DB, name string) *Collection[T] {
 	mustValidName(name)
 	return &Collection[T]{db: db, name: name}

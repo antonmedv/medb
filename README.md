@@ -1,4 +1,5 @@
 # MeDB
+[![GoDoc](https://godoc.org/antonmedv/medb?status.svg)](https://godoc.org/github.com/antonmedv/medb)
 
 I was building a simple Go server and kept users in a map. I wanted to save them to disk, but a full database felt like
 too much, so I just wrote the map to a JSON file. It worked, but I wanted the same simplicity with durability. A map in memory, stored as JSON on disk, without losing
@@ -51,6 +52,15 @@ func main() {
 	fmt.Printf("%s is %d years old\n", user.Name, user.Age)
 }
 ```
+
+Go 1.27 and newer also support the equivalent method syntax:
+
+```go
+users := db.C[User]("users")
+```
+
+The package-level `medb.C` function remains available on every supported Go
+version.
 
 ## License
 

@@ -10,8 +10,6 @@ import (
 	"github.com/antonmedv/medb"
 )
 
-// A JSON null decodes into a Go string or bool without an error, so every
-// required member has to reject it rather than silently accept the zero value.
 func TestNullMembersAreRejected(t *testing.T) {
 	api, _, token := newTestAPI(t)
 	tests := []struct {
@@ -43,7 +41,7 @@ func TestNullMembersAreRejected(t *testing.T) {
 		})
 	}
 
-	// The rejected set must not have written anything under the empty ID.
+	// The rejected set must not have written under the empty ID.
 	response := callJSON(t, api, token, http.MethodPost, "/v1/has", map[string]any{
 		"collection": "docs", "id": "",
 	})
@@ -52,8 +50,6 @@ func TestNullMembersAreRejected(t *testing.T) {
 	}
 }
 
-// A null "disabled" is rejected, but a present boolean still toggles the flag
-// and an omitted member still leaves it alone.
 func TestUserUpdateDisabledFlag(t *testing.T) {
 	api, _, token := newTestAPI(t)
 	response := callJSON(t, api, token, http.MethodPost, "/v1/auth/users/create", map[string]any{
@@ -90,7 +86,6 @@ func TestUserUpdateDisabledFlag(t *testing.T) {
 		}
 	}
 
-	// A null "disabled" must not re-enable a disabled user.
 	response = callJSON(t, api, token, http.MethodPost, "/v1/auth/users/update", map[string]any{
 		"user_id": created.User.ID, "disabled": true,
 	})
@@ -110,7 +105,7 @@ func TestUserUpdateDisabledFlag(t *testing.T) {
 	}
 }
 
-// expires_at is the one member where the specification allows an explicit null.
+// expires_at is the one member where a null is a legal value.
 func TestTokenExpiry(t *testing.T) {
 	api, _, token := newTestAPI(t)
 	response := callJSON(t, api, token, http.MethodPost, "/v1/auth/users/create", map[string]any{
@@ -188,8 +183,6 @@ func TestHealthEndpoint(t *testing.T) {
 		t.Fatalf("health query: status %d, body %s", response.Code, response.Body.String())
 	}
 
-	// A shutting-down or failed server reports unavailable so a load balancer
-	// stops sending it traffic.
 	api.shuttingDown.Store(true)
 	response = callRaw(t, api, "", http.MethodGet, "/healthz", "")
 	if response.Code != http.StatusServiceUnavailable || responseCode(t, response) != "unavailable" {
@@ -216,14 +209,12 @@ func TestUnavailableServerRejectsAPIRequests(t *testing.T) {
 	}
 }
 
-// A library panic must become internal_error and leave a report in the log
-// rather than terminating the process or vanishing silently.
 func TestPanicBecomesInternalErrorAndIsLogged(t *testing.T) {
 	api, db, token := newTestAPI(t)
 	var logs bytes.Buffer
 	api.log = newLogger(&logs)
 
-	// A stored user record which cannot decode makes Collection.All panic.
+	// A record which cannot decode makes Collection.All panic.
 	if err := medb.C[json.RawMessage](db, userCollection).Set(
 		"ffffffffffffffffffffffffffffffff", json.RawMessage(`"not an object"`)); err != nil {
 		t.Fatal(err)
@@ -238,15 +229,12 @@ func TestPanicBecomesInternalErrorAndIsLogged(t *testing.T) {
 	if !strings.Contains(logs.String(), "stack=") {
 		t.Fatalf("panic log carries no stack: %q", logs.String())
 	}
-	// The response must not leak the panic text or the stored document.
 	if strings.Contains(response.Body.String(), "not an object") ||
 		strings.Contains(response.Body.String(), "decode") {
 		t.Fatalf("internal error leaked detail: %s", response.Body.String())
 	}
 }
 
-// A malformed stored record which does not panic is still an internal error,
-// and the cause reaches the log.
 func TestMalformedStoredRecordIsLogged(t *testing.T) {
 	api, _, token := newTestAPI(t)
 	var logs bytes.Buffer
@@ -268,7 +256,6 @@ func TestMalformedStoredRecordIsLogged(t *testing.T) {
 		t.Fatalf("cause was not logged: %q", logs.String())
 	}
 
-	// An update against the same record refuses to write on top of it.
 	logs.Reset()
 	response = callJSON(t, api, token, http.MethodPost, "/v1/auth/users/update", map[string]any{
 		"user_id": uid, "role": "reader",

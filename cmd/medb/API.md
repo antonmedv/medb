@@ -1,6 +1,6 @@
 # MeDB HTTP API
 
-The default base URL is `http://127.0.0.1:8080`. See the
+The default base URL is `http://127.0.0.1:6332`. See the
 [server README](README.md) for setup and curl examples.
 
 ## Basics

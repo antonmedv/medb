@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	defaultListen          = "127.0.0.1:8080"
+	defaultListen          = "127.0.0.1:6332"
 	defaultMaxDocSize      = 16 << 20
 	defaultFlushBytes      = 64 << 20
 	defaultFlushInterval   = 5 * time.Second
@@ -97,9 +97,7 @@ func parseServeConfig(args []string, stderr io.Writer, getenv envLookup) (serveC
 	if cfg.shutdownTimeout, err = parsePositiveDuration("shutdown timeout", shutdown); err != nil {
 		return cfg, err
 	}
-	// A set request carries its document inside a JSON envelope, so a document
-	// limit at or above the request limit makes every large set fail with
-	// request_too_large instead of storing the document.
+	// A set request wraps its document in an envelope, so the body limit is larger.
 	if cfg.maxRequestSize <= int64(cfg.maxDocSize) {
 		return cfg, fmt.Errorf(
 			"medb: max request size (%d) must exceed max document size (%d) to leave room for the request envelope",

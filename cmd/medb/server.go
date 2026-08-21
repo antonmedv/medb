@@ -17,13 +17,6 @@ import (
 	"github.com/antonmedv/medb"
 )
 
-// HTTP transport limits.
-//
-// readTimeout bounds a complete request read so a client which stalls part way
-// through a body cannot hold a connection open indefinitely, and writeTimeout
-// does the same for a response. A scan streams for as long as its client keeps
-// making progress: it extends its own write deadline before each record, so
-// writeTimeout bounds the gap between records rather than the whole stream.
 const (
 	readHeaderTimeout = 5 * time.Second
 	readTimeout       = 60 * time.Second
@@ -63,8 +56,6 @@ func newAPIServer(db *medb.DB, cfg serveConfig, logger *slog.Logger) *apiServer 
 	return s
 }
 
-// buildRoutes returns the route table. The table depends only on configuration,
-// so it is built once and then read without synchronization.
 func (s *apiServer) buildRoutes() map[string]route {
 	routes := map[string]route{
 		"/v1/collections": {method: http.MethodGet, role: roleReader, handler: s.handleCollections},
@@ -88,11 +79,8 @@ func (s *apiServer) buildRoutes() map[string]route {
 	return routes
 }
 
-// ServeHTTP dispatches one request. Handlers run concurrently; the server
-// relies on MeDB's own locking for thread safety and operation ordering, and
-// holds no lock of its own across a body read or a response write.
-//
-// Cache-Control is set here for every response the server produces.
+// ServeHTTP dispatches one request. Handlers run concurrently and hold no
+// server-wide lock; MeDB provides thread safety and operation ordering.
 func (s *apiServer) ServeHTTP(base http.ResponseWriter, r *http.Request) {
 	w := &trackedResponseWriter{ResponseWriter: base}
 	w.Header().Set("Cache-Control", "no-store")
@@ -101,8 +89,7 @@ func (s *apiServer) ServeHTTP(base http.ResponseWriter, r *http.Request) {
 		if value == nil {
 			return
 		}
-		// A handler which aborts deliberately is not a server fault; let
-		// net/http drop the connection without a report.
+		// Let net/http handle a deliberate abort.
 		if value == http.ErrAbortHandler {
 			panic(value)
 		}
@@ -127,8 +114,7 @@ func (s *apiServer) ServeHTTP(base http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Authentication precedes route lookup so an unknown path under /v1 cannot
-	// be probed without a credential.
+	// Authentication precedes route lookup so an unknown path cannot be probed.
 	actor := roleAdmin
 	if !s.cfg.noAuth {
 		var authFailure *apiFailure
@@ -212,9 +198,6 @@ func (s *apiServer) markStorageFailure(err error) {
 	})
 }
 
-// internalError reports a server-side fault. The response carries no detail;
-// the cause is logged instead. Never pass a value derived from a credential or
-// a stored document.
 func (s *apiServer) internalError(w http.ResponseWriter, r *http.Request, err error) {
 	s.log.Error("internal error", "method", r.Method, "path", r.URL.Path, "error", err)
 	writeFailure(w, failInternal)
@@ -252,8 +235,6 @@ type trackedResponseWriter struct {
 	wroteHeader bool
 }
 
-// Unwrap lets http.ResponseController reach the deadline and flush methods of
-// the writer underneath this one.
 func (w *trackedResponseWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }

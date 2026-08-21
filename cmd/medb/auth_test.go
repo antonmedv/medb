@@ -46,7 +46,7 @@ func TestListUsers(t *testing.T) {
 	if len(listed.Users) != 2 {
 		t.Fatalf("listed %d users: %s", len(listed.Users), response.Body.String())
 	}
-	// Users are ordered by ID, which is how Collection.All iterates.
+	// Collection.All iterates by ID.
 	for i := 1; i < len(listed.Users); i++ {
 		if listed.Users[i-1].ID >= listed.Users[i].ID {
 			t.Fatalf("users are not ordered by ID: %s", response.Body.String())
@@ -67,7 +67,6 @@ func TestListUsers(t *testing.T) {
 	if found.CreatedAt == "" || found.UpdatedAt == "" {
 		t.Fatalf("user view has no timestamps: %+v", *found)
 	}
-	// A listing must never carry a credential.
 	if strings.Contains(response.Body.String(), "medb_") {
 		t.Fatal("user listing leaked a token")
 	}
@@ -119,7 +118,6 @@ func TestListTokens(t *testing.T) {
 	if view.ExpiresAt == nil || *view.ExpiresAt != "2999-01-01T00:00:00Z" {
 		t.Fatalf("token expiry not reported: %+v", view)
 	}
-	// The plaintext token is disclosed once, at creation, and never again.
 	if strings.Contains(response.Body.String(), created.Token) ||
 		strings.Contains(response.Body.String(), "medb_") {
 		t.Fatalf("token listing leaked a plaintext token: %s", response.Body.String())
@@ -149,7 +147,7 @@ func TestAuthManagementNotFound(t *testing.T) {
 		})
 	}
 
-	// Revocation is idempotent, so an unknown token ID is still a success.
+	// Revocation is idempotent.
 	response := callJSON(t, api, token, http.MethodPost, "/v1/auth/tokens/revoke", map[string]any{
 		"token_id": unknownToken,
 	})
@@ -157,7 +155,6 @@ func TestAuthManagementNotFound(t *testing.T) {
 		t.Fatalf("revoke unknown: status %d, body %s", response.Code, response.Body.String())
 	}
 
-	// Malformed identifiers are schema errors, not lookups.
 	for _, body := range []string{
 		`{"user_id":"tooshort"}`,
 		`{"user_id":"NOTLOWERCASEHEX0000000000000000A"}`,
@@ -184,7 +181,6 @@ func TestCredentialsFailClosed(t *testing.T) {
 	api, db, token := newTestAPI(t)
 	auth := newAuthStore(db)
 
-	// A disabled user's token stops working.
 	user := createUser(t, api, token, "temporary", roleReader)
 	response := callJSON(t, api, token, http.MethodPost, "/v1/auth/tokens/create", map[string]any{
 		"user_id": user.ID, "label": "temporary",
@@ -215,7 +211,6 @@ func TestCredentialsFailClosed(t *testing.T) {
 		t.Fatalf("disabled user request: status %d, body %s", response.Code, response.Body.String())
 	}
 
-	// An expired token stops working at its expiry instant.
 	expiring, err := newToken()
 	if err != nil {
 		t.Fatal(err)
@@ -246,7 +241,6 @@ func TestCredentialsFailClosed(t *testing.T) {
 		t.Fatal("a token authenticates at its expiry instant")
 	}
 
-	// Malformed Authorization headers never resolve to a principal.
 	for _, header := range []string{"", "Token abc", "Bearer", "Bearer a b", "bearer not-a-token"} {
 		request := newRequestWithAuthorization(t, header)
 		actor, fail := api.authenticateRequest(request)
@@ -254,7 +248,6 @@ func TestCredentialsFailClosed(t *testing.T) {
 			t.Fatalf("header %q authenticated as %q", header, actor)
 		}
 	}
-	// Two Authorization headers are rejected outright.
 	request := newRequestWithAuthorization(t, "Bearer "+token)
 	request.Header.Add("Authorization", "Bearer "+token)
 	if _, fail := api.authenticateRequest(request); fail != failInvalidToken {
@@ -274,8 +267,6 @@ func newRequestWithAuthorization(t *testing.T, header string) *http.Request {
 	return request
 }
 
-// The server refuses to start when no enabled administrator holds a live token,
-// because that state is only recoverable offline.
 func TestStartupRequiresAnActiveAdministrator(t *testing.T) {
 	dir := t.TempDir()
 	db, err := medb.Open(dir)
@@ -296,7 +287,6 @@ func TestStartupRequiresAnActiveAdministrator(t *testing.T) {
 		t.Fatalf("hasActiveAdmin = %v, %v", ok, err)
 	}
 
-	// Disable the only administrator.
 	for id, user := range auth.users.All() {
 		user.Disabled = true
 		user.UpdatedAt = nowTimestamp()
@@ -315,7 +305,6 @@ func TestStartupRequiresAnActiveAdministrator(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Offline recovery restores a usable administrator.
 	var stdout bytes.Buffer
 	if err := recoverAuth(recoverConfig{dir: dir, name: "operator"}, &stdout, newLogger(io.Discard)); err != nil {
 		t.Fatal(err)
@@ -330,7 +319,6 @@ func TestStartupRequiresAnActiveAdministrator(t *testing.T) {
 	}
 }
 
-// An expired administrator token does not count as an active credential.
 func TestStartupRejectsExpiredAdministratorToken(t *testing.T) {
 	dir := t.TempDir()
 	db, err := medb.Open(dir)
@@ -455,7 +443,6 @@ func TestDropAndReservedNamespaceEnforcement(t *testing.T) {
 		t.Fatalf("count after drop: %s", response.Body.String())
 	}
 
-	// Every data endpoint refuses the reserved namespace, including for admins.
 	for _, path := range []string{"/v1/drop", "/v1/count", "/v1/scan"} {
 		for _, name := range []string{"_meta", "_meta/state", "_meta/tokens"} {
 			response = callJSON(t, api, token, http.MethodPost, path, map[string]any{"collection": name})
@@ -473,7 +460,6 @@ func TestDropAndReservedNamespaceEnforcement(t *testing.T) {
 		}
 	}
 
-	// A missing document reports absence rather than an error.
 	response = callJSON(t, api, token, http.MethodPost, "/v1/has", map[string]any{
 		"collection": "temp/data", "id": "gone",
 	})
@@ -544,7 +530,6 @@ func TestValidationHelpers(t *testing.T) {
 		if roleAllows(roleReader, roleWriter) || roleAllows(roleWriter, roleAdmin) {
 			t.Error("hierarchy allows an escalation")
 		}
-		// An unknown role ranks below every requirement.
 		if roleAllows("sorcerer", roleReader) {
 			t.Error("an unknown role was allowed")
 		}

@@ -16,9 +16,8 @@ import (
 	"github.com/antonmedv/medb"
 )
 
-// startTestServer runs an unauthenticated API over a real TCP listener. A real
-// connection is required to observe blocking: httptest.ResponseRecorder accepts
-// a whole response without ever making a handler wait on a socket.
+// A real listener is required to observe blocking: httptest.ResponseRecorder
+// never makes a handler wait on a socket.
 func startTestServer(t *testing.T) (string, *medb.DB) {
 	t.Helper()
 	dir := t.TempDir()
@@ -38,8 +37,7 @@ func startTestServer(t *testing.T) (string, *medb.DB) {
 	return server.URL, db
 }
 
-// seedLargeCollection stores enough data that a scan response cannot fit in the
-// kernel socket buffers, so the scan handler has to block on a write.
+// Enough data that a scan cannot fit in the socket buffers.
 func seedLargeCollection(t *testing.T, db *medb.DB, collection string) {
 	t.Helper()
 	document, err := json.Marshal(strings.Repeat("x", 64<<10))
@@ -54,8 +52,6 @@ func seedLargeCollection(t *testing.T, db *medb.DB, collection string) {
 	}
 }
 
-// A scan streams under no server-wide lock, so a client which stops consuming
-// the stream must not stall unrelated writes.
 func TestScanInFlightDoesNotBlockWrites(t *testing.T) {
 	base, db := startTestServer(t)
 	seedLargeCollection(t, db, "docs")
@@ -69,7 +65,7 @@ func TestScanInFlightDoesNotBlockWrites(t *testing.T) {
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("scan: status %d", response.StatusCode)
 	}
-	// Read one byte so the handler is certainly streaming, then stop consuming.
+	// Start the stream, then stop consuming it.
 	if _, err := response.Body.Read(make([]byte, 1)); err != nil {
 		t.Fatal(err)
 	}
@@ -86,8 +82,6 @@ func TestScanInFlightDoesNotBlockWrites(t *testing.T) {
 	}
 }
 
-// A request body is read inside the handler under no server-wide lock, so a
-// client which stalls part way through one must not stall other requests.
 func TestPartialRequestBodyDoesNotBlockOtherRequests(t *testing.T) {
 	base, _ := startTestServer(t)
 	address := strings.TrimPrefix(base, "http://")
@@ -128,7 +122,6 @@ func TestPartialRequestBodyDoesNotBlockOtherRequests(t *testing.T) {
 	}
 }
 
-// Mutations still run concurrently with each other.
 func TestConcurrentWritesAllSucceed(t *testing.T) {
 	base, _ := startTestServer(t)
 	const writers = 16

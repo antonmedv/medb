@@ -19,8 +19,7 @@ import (
 	"github.com/antonmedv/medb"
 )
 
-// syncBuffer collects log output written from the server goroutine while the
-// test reads it.
+// The server logs from its own goroutine while the test reads.
 type syncBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -109,7 +108,6 @@ func TestServeInitializesListensAndShutsDown(t *testing.T) {
 		t.Fatal("serve did not return after cancellation")
 	}
 
-	// A clean shutdown releases the database lock.
 	db, err := medb.Open(dir)
 	if err != nil {
 		t.Fatalf("directory still locked after shutdown: %v", err)
@@ -135,7 +133,7 @@ func TestServeFailures(t *testing.T) {
 			t.Fatal(err)
 		}
 		cfg := testServeConfig(dir)
-		cfg.listen = "256.256.256.256:8080"
+		cfg.listen = "256.256.256.256:6332"
 		err = serve(context.Background(), cfg, newLogger(io.Discard),
 			envMap{"MEDB_INIT_ADMIN_TOKEN": token}.lookup)
 		if err == nil || !strings.Contains(err.Error(), "listen on") {
@@ -184,14 +182,12 @@ func TestRunCommandDispatch(t *testing.T) {
 		})
 	}
 
-	// Usage goes to standard error, never standard output.
 	var stdout, stderr bytes.Buffer
 	_ = run(context.Background(), []string{"frobnicate"}, &stdout, &stderr, envMap{}.lookup)
 	if !strings.Contains(stderr.String(), "medb serve [options]") {
 		t.Fatalf("usage missing from standard error: %q", stderr.String())
 	}
 
-	// -h is reported as flag.ErrHelp so main can exit quietly.
 	stderr.Reset()
 	err := run(context.Background(), []string{"serve", "-h"}, &stdout, &stderr, envMap{}.lookup)
 	if !errors.Is(err, flag.ErrHelp) {
@@ -219,7 +215,6 @@ func TestRunAuthRecover(t *testing.T) {
 		t.Fatalf("invalid recovery output: %q", stdout.String())
 	}
 
-	// The recovered credential is enough for the server to start.
 	db, err := medb.Open(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -271,7 +266,6 @@ func TestServeConfigRejectsIncoherentSizes(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 
-	// The documented defaults are coherent.
 	cfg, err := parseServeConfig([]string{"--dir", "/data"}, io.Discard, envMap{}.lookup)
 	if err != nil {
 		t.Fatal(err)
@@ -351,8 +345,6 @@ func TestMutationErrorClassification(t *testing.T) {
 	api.mutationError(httptest.NewRecorder(), errors.New("another failure"))
 }
 
-// A closed database makes data endpoints report unavailable rather than a
-// storage fault.
 func TestClosedDatabaseReportsUnavailable(t *testing.T) {
 	dir := t.TempDir()
 	db, err := medb.Open(dir)
@@ -404,7 +396,7 @@ func TestInitialTokenSources(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 
-	// One trailing LF or CRLF is ignored; anything else is part of the token.
+	// One trailing LF or CRLF is ignored; other bytes are part of the token.
 	for _, ending := range []string{"", "\n", "\r\n"} {
 		if err := os.WriteFile(path, []byte(token+ending), 0o600); err != nil {
 			t.Fatal(err)

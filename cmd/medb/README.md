@@ -20,17 +20,17 @@ MEDB_INIT_ADMIN_TOKEN_FILE="$PWD/admin-token" \
   medb serve --dir ./data
 ```
 
-The server listens on `127.0.0.1:8080` by default. In another shell:
+The server listens on `127.0.0.1:6332` by default. In another shell:
 
 ```sh
 TOKEN="$(cat admin-token)"
 
-curl -sS http://127.0.0.1:8080/v1/set \
+curl -sS http://127.0.0.1:6332/v1/set \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   --data '{"collection":"notes/team","id":"roadmap/2026?#","document":{"status":"draft"}}'
 
-curl -sS http://127.0.0.1:8080/v1/get \
+curl -sS http://127.0.0.1:6332/v1/get \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   --data '{"collection":"notes/team","id":"roadmap/2026?#"}'

@@ -62,8 +62,7 @@ func writeFailure(w http.ResponseWriter, f *apiFailure) {
 	writeJSON(w, f.status, errorEnvelope{Error: errorBody{Code: f.code, Message: f.message}})
 }
 
-// writeJSON and writeNoContent rely on [apiServer.ServeHTTP] having already set
-// Cache-Control on the response, which it does for every request it handles.
+// Cache-Control is already set by [apiServer.ServeHTTP] for every response.
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
@@ -219,10 +218,8 @@ func parseHex4(data []byte, start int) (uint16, bool) {
 }
 
 // isJSONNull reports whether raw is the JSON literal null. Unmarshalling null
-// into a Go string or bool leaves the value untouched and reports no error, so
-// every required member has to reject it explicitly. Otherwise a null aliases
-// the zero value: a null "id" would silently mean the empty ID, and a null
-// "disabled" would silently mean false.
+// into a string or bool is a no-op returning no error, so a null has to be
+// rejected explicitly rather than aliasing the zero value.
 func isJSONNull(raw json.RawMessage) bool {
 	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
 }
@@ -266,9 +263,7 @@ func optionalBoolField(fields map[string]json.RawMessage, name string) (*bool, *
 	return &value, nil
 }
 
-// validCollectionName mirrors the grammar accepted by medb.C, which panics on an
-// invalid name. The two must stay in lockstep: anything accepted here is passed
-// straight to medb.C.
+// validCollectionName mirrors the grammar of medb.C, which panics on a bad name.
 func validCollectionName(name string) bool {
 	if len(name) == 0 || len(name) > 240 {
 		return false

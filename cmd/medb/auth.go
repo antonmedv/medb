@@ -202,9 +202,7 @@ func validateStateRecord(state stateRecord) error {
 	return nil
 }
 
-// authenticate resolves a bearer token to the role it currently grants. It
-// fails closed: a malformed record, an expired token, an unknown or disabled
-// user, and an unknown role all report false.
+// authenticate resolves a bearer token to the role it grants, failing closed.
 func (a *authStore) authenticate(token string, now time.Time) (role, bool) {
 	if !validToken(token) {
 		return "", false

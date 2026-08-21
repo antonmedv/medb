@@ -21,5 +21,7 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
-      - name: Test
-        run: npx zx .github/scripts/coverage.mjs
+      - name: Coverage lib
+        run: npx zx .github/scripts/coverage.mjs . 90
+      - name: Coverage cmd
+        run: npx zx .github/scripts/coverage.mjs cmd 80

@@ -1,23 +1,21 @@
 #!/usr/bin/env zx
 
-const expected = 80
-const exclude = [
-  'benchmarks', // Benchmark-only package, not part of the main codebase.
-]
+// Measures coverage of a single Go module. The library and the CLI are separate
+// modules, so each needs its own run:
+//
+//   zx .github/scripts/coverage.mjs .   80
+//   zx .github/scripts/coverage.mjs cmd 80
 
-cd(path.resolve(__dirname, '..', '..'))
+const [dir, expected] = argv._
+if (dir === undefined || expected === undefined) {
+  echo(chalk.red('usage: coverage.mjs <dir> <expected>'))
+  process.exit(2)
+}
+
+cd(path.resolve(__dirname, '..', '..', dir))
 
 await spinner('Running tests', async () => {
-  await $`go test -coverprofile=coverage.out -coverpkg=github.com/antonmedv/medb/... ./...`
-  const coverage = fs.readFileSync('coverage.out').toString()
-    .split('\n')
-    .filter(line => {
-      for (const ex of exclude)
-        if (line.includes(ex)) return false
-      return true
-    })
-    .join('\n')
-  fs.writeFileSync('coverage.out', coverage)
+  await $`go test -coverprofile=coverage.out -coverpkg=./... ./...`
   await $`go tool cover -html=coverage.out -o coverage.html`
 })
 

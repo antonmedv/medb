@@ -26,7 +26,11 @@ jobs:
         with:
           go-version: ${{ matrix.go-version }}
       - name: Build
-        run: GOARCH=${{ matrix.go-arch }} go build ./...
+        env:
+          GOARCH: ${{ matrix.go-arch }}
+        run: |
+          go build ./...
+          go build -C cmd -o /dev/null ./...
 
   cross:
     runs-on: ubuntu-latest

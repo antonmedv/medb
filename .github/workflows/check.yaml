@@ -22,6 +22,6 @@ jobs:
         with:
           go-version: stable
       - name: Coverage lib
-        run: npx zx .github/scripts/coverage.mjs . 90
+        run: npx zx@8.8.5 .github/scripts/coverage.mjs . 90
       - name: Coverage cmd
-        run: npx zx .github/scripts/coverage.mjs cmd 80
+        run: npx zx@8.8.5 .github/scripts/coverage.mjs cmd 80

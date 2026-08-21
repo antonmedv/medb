@@ -113,14 +113,14 @@ func Open(dir string, opts ...Option) (*DB, error) {
 	logPath := filepath.Join(dir, walName)
 	log, err := openLog(logPath)
 	if err != nil {
-		flock.Close()
+		_ = flock.Close()
 		return nil, err
 	}
 	ok := false
 	defer func() {
 		if !ok {
-			log.Close()
-			flock.Close()
+			_ = log.Close()
+			_ = flock.Close()
 		}
 	}()
 	db := &DB{

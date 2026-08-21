@@ -8,16 +8,29 @@ import (
 	"slices"
 )
 
+// Collection provides typed access to one collection in a [DB]. It encodes
+// documents as JSON. Use compatible document types whenever you open the same
+// stored collection.
 type Collection[T any] struct {
 	db   *DB
 	name string
 }
 
+// C returns a typed handle for name in db. It does not create stored data.
+// The first successful [Collection.Set] creates the collection.
+//
+// A name may contain lowercase ASCII letters, digits, hyphens, underscores,
+// and slash-separated path segments. It must not exceed 240 bytes. C panics if
+// the name is invalid. Document IDs may contain any string.
 func C[T any](db *DB, name string) *Collection[T] {
 	mustValidName(name)
 	return &Collection[T]{db: db, name: name}
 }
 
+// Get decodes and returns the document with id. It returns [ErrNotFound] if the
+// document does not exist and [ErrClosed] if the database has closed. It
+// returns a JSON decoding error if the stored document is not compatible with
+// T.
 func (c *Collection[T]) Get(id string) (T, error) {
 	var zero T
 	c.db.mu.RLock()
@@ -37,6 +50,10 @@ func (c *Collection[T]) Get(id string) (T, error) {
 	return v, nil
 }
 
+// Set encodes and stores doc under id. It replaces any document with the same
+// id. A successful return means the change is durable. Set returns
+// [ErrTooLarge] if the encoded document exceeds the size limit and [ErrClosed]
+// if the database has closed. It can also return a JSON encoding error.
 func (c *Collection[T]) Set(id string, doc T) error {
 	raw, err := json.Marshal(doc)
 	if err != nil {
@@ -61,6 +78,9 @@ func (c *Collection[T]) Set(id string, doc T) error {
 	return commit.wait()
 }
 
+// Delete removes the document with id. It does nothing if the document does
+// not exist. A successful return means the change is durable. Delete returns
+// [ErrClosed] if the database has closed.
 func (c *Collection[T]) Delete(id string) error {
 	rec := record{Op: opDel, Coll: c.name, ID: id}
 	buf, err := json.Marshal(rec)
@@ -78,6 +98,15 @@ func (c *Collection[T]) Delete(id string) error {
 	return commit.wait()
 }
 
+// Update replaces the document with the value returned by fn. It returns
+// [ErrNotFound] without calling fn if the document does not exist. If fn or JSON
+// encoding returns an error, Update leaves the document unchanged. It also
+// returns [ErrTooLarge] for an oversized result and [ErrClosed] after the
+// database closes. If fn panics, Update leaves the document unchanged and
+// continues the panic.
+//
+// Update blocks other operations on the database while fn runs. Keep fn short,
+// and do not call methods on the same database from fn.
 func (c *Collection[T]) Update(id string, fn func(T) (T, error)) error {
 	commit, err := func() (*commit, error) {
 		c.db.mu.Lock()
@@ -120,6 +149,7 @@ func (c *Collection[T]) Update(id string, fn func(T) (T, error)) error {
 	return commit.wait()
 }
 
+// Has reports whether id exists. It reports false after the database closes.
 func (c *Collection[T]) Has(id string) bool {
 	c.db.mu.RLock()
 	defer c.db.mu.RUnlock()
@@ -130,6 +160,8 @@ func (c *Collection[T]) Has(id string) bool {
 	return ok
 }
 
+// Count returns the number of documents in the collection. It returns zero
+// after the database closes.
 func (c *Collection[T]) Count() int {
 	c.db.mu.RLock()
 	defer c.db.mu.RUnlock()
@@ -139,6 +171,10 @@ func (c *Collection[T]) Count() int {
 	return len(c.db.colls[c.name])
 }
 
+// All returns a sequence over the collection. Each iteration takes a snapshot,
+// then yields its documents by id in ascending order. Later changes do not
+// affect that iteration. The sequence yields no documents after the database
+// closes and panics if a stored document cannot decode into T.
 func (c *Collection[T]) All() iter.Seq2[string, T] {
 	return func(yield func(string, T) bool) {
 		c.db.mu.RLock()

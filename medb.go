@@ -22,13 +22,23 @@ const (
 )
 
 var (
+	// ErrNotFound reports that a document does not exist.
 	ErrNotFound = errors.New("medb: document not found")
-	ErrLocked   = lock.ErrLocked
-	ErrClosed   = errors.New("medb: database is closed")
+
+	// ErrLocked reports that another process has opened the database directory.
+	ErrLocked = lock.ErrLocked
+
+	// ErrClosed reports an operation on a closed database.
+	ErrClosed = errors.New("medb: database is closed")
+
+	// ErrTooLarge reports that a document exceeds the configured size limit.
 	ErrTooLarge = errors.New("medb: document exceeds size limit")
-	ErrDirSync  = fsutil.ErrDirSync
+
+	// ErrDirSync reports a failure to make a directory change durable.
+	ErrDirSync = fsutil.ErrDirSync
 )
 
+// Option configures a database when [Open] opens it.
 type Option func(*options)
 
 type options struct {
@@ -37,14 +47,27 @@ type options struct {
 	flushInterval time.Duration
 }
 
+// WithMaxDocSize sets the largest encoded JSON document that
+// [Collection.Set] and [Collection.Update] accept. The size is in bytes and
+// must be positive. The default is 16 MiB.
 func WithMaxDocSize(n int) Option {
 	return func(o *options) { o.maxDocSize = n }
 }
 
+// WithFlushBytes sets the log size that triggers a JSON snapshot. The size is
+// in bytes and must be positive. The default is 64 MiB.
+//
+// This option controls snapshot timing, not write durability. MeDB syncs each
+// successful change to the log before returning.
 func WithFlushBytes(n int64) Option {
 	return func(o *options) { o.flushBytes = n }
 }
 
+// WithFlushInterval sets how often MeDB writes changed collections to JSON
+// snapshot files. The duration must be positive. The default is 5 seconds.
+//
+// This option controls snapshot timing, not write durability. MeDB syncs each
+// successful change to the log before returning.
 func WithFlushInterval(d time.Duration) Option {
 	return func(o *options) { o.flushInterval = d }
 }
@@ -62,6 +85,8 @@ func (o options) validate() error {
 	return nil
 }
 
+// DB stores collections in one directory. Its methods are safe to call from
+// concurrent goroutines.
 type DB struct {
 	flock *os.File
 	dir   string
@@ -87,6 +112,12 @@ type DB struct {
 	failed error
 }
 
+// Open opens or creates the database in dir.
+//
+// Open loads existing JSON snapshots, replays the write-ahead log, and starts
+// the background snapshot worker. It returns [ErrLocked] if another process
+// already has the directory open. Call [DB.Close] to flush pending work and
+// release the directory lock.
 func Open(dir string, opts ...Option) (*DB, error) {
 	o := options{
 		maxDocSize:    16 << 20,
@@ -149,6 +180,9 @@ func Open(dir string, opts ...Option) (*DB, error) {
 	return db, nil
 }
 
+// Close writes pending data, stops background work, and releases the directory
+// lock. It returns any storage error found during that work. A second call
+// returns [ErrClosed].
 func (db *DB) Close() error {
 	db.mu.Lock()
 	if db.closed {
@@ -175,6 +209,9 @@ func (db *DB) Close() error {
 	return err
 }
 
+// Collections returns the existing collection names in ascending order.
+// Creating a collection handle with [C] does not add its name; the first
+// [Collection.Set] adds it. Collections returns nil after the database closes.
 func (db *DB) Collections() []string {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
@@ -184,6 +221,10 @@ func (db *DB) Collections() []string {
 	return slices.Sorted(maps.Keys(db.colls))
 }
 
+// Drop removes a collection and all its documents. It does nothing if the
+// collection does not exist. A successful return makes the change durable.
+// It returns [ErrClosed] after the database closes. Drop panics if name is not
+// a valid collection name; see [C].
 func (db *DB) Drop(name string) error {
 	mustValidName(name)
 	rec := record{Op: opDrop, Coll: name}

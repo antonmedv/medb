@@ -11,6 +11,47 @@ That is how this database was born. MeDB is a small embedded in memory database 
 3. Only one process can open the database at a time.
 4. Concurrent reads/writes are safe.
 
+## Usage
+
+```go
+package main
+
+import (
+	"fmt"
+
+	"github.com/antonmedv/medb"
+)
+
+type User struct {
+	Name string
+	Age  int
+}
+
+func main() {
+	db, err := medb.Open("data")
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		if err := db.Close(); err != nil {
+			panic(err)
+		}
+	}()
+
+	users := medb.C[User](db, "users")
+
+	if err := users.Set("ada", User{Name: "Ada", Age: 36}); err != nil {
+		panic(err)
+	}
+
+	user, err := users.Get("ada")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("%s is %d years old\n", user.Name, user.Age)
+}
+```
+
 ## License
 
 [MIT](LICENSE)

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -26,7 +27,7 @@ func startTestServer(t *testing.T) (string, *medb.DB) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if err := db.Close(); err != nil && !errorIsClosed(err) {
+		if err := db.Close(); err != nil && !errors.Is(err, medb.ErrClosed) {
 			t.Errorf("close database: %v", err)
 		}
 	})
@@ -35,10 +36,6 @@ func startTestServer(t *testing.T) (string, *medb.DB) {
 	server := httptest.NewServer(newAPIServer(db, cfg, newLogger(&bytes.Buffer{})))
 	t.Cleanup(server.Close)
 	return server.URL, db
-}
-
-func errorIsClosed(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "closed")
 }
 
 // seedLargeCollection stores enough data that a scan response cannot fit in the

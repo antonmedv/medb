@@ -192,11 +192,10 @@ func (s *apiServer) handleScan(w http.ResponseWriter, r *http.Request) {
 		default:
 		}
 		// Extend the deadline per record so the write timeout bounds the gap
-		// between records rather than the length of the whole stream.
-		if err := control.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil &&
-			!errors.Is(err, http.ErrNotSupported) {
-			return
-		}
+		// between records rather than the length of the whole stream. This is
+		// advisory: a writer without deadline support keeps the server-wide
+		// timeout, and a write which then fails is reported by Encode.
+		_ = control.SetWriteDeadline(time.Now().Add(writeTimeout))
 		if err := encoder.Encode(scanRecord{ID: id, Document: document}); err != nil {
 			return
 		}

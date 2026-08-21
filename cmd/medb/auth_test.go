@@ -216,18 +216,33 @@ func TestCredentialsFailClosed(t *testing.T) {
 	}
 
 	// An expired token stops working at its expiry instant.
+	expiring, err := newToken()
+	if err != nil {
+		t.Fatal(err)
+	}
 	expiry := time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
-	expiringID := tokenID("medb_" + strings.Repeat("A", 43))
-	if err := auth.tokens.Set(expiringID, tokenRecord{
+	if err := auth.tokens.Set(tokenID(expiring), tokenRecord{
 		UserID: user.ID, Label: "expiring", CreatedAt: nowTimestamp(), ExpiresAt: &expiry,
 	}); err != nil {
 		t.Fatal(err)
+	}
+	if _, ok := auth.authenticate(expiring, time.Now()); ok {
+		t.Fatal("a token for a disabled user authenticates before expiry")
+	}
+	if err := api.auth.users.Update(user.ID, func(u userRecord) (userRecord, error) {
+		u.Disabled = false
+		return u, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := auth.authenticate(expiring, time.Now()); !ok {
+		t.Fatal("an unexpired token does not authenticate")
 	}
 	parsed, err := parseUTCTimestamp(expiry)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := auth.authenticate("medb_"+strings.Repeat("A", 43), parsed); ok {
+	if _, ok := auth.authenticate(expiring, parsed); ok {
 		t.Fatal("a token authenticates at its expiry instant")
 	}
 
@@ -332,7 +347,11 @@ func TestStartupRejectsExpiredAdministratorToken(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := auth.tokens.Set(tokenID("medb_"+strings.Repeat("B", 43)), tokenRecord{
+	expired, err := newToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := auth.tokens.Set(tokenID(expired), tokenRecord{
 		UserID: uid, Label: "expired", CreatedAt: created, ExpiresAt: &past,
 	}); err != nil {
 		t.Fatal(err)

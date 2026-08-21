@@ -267,4 +267,23 @@ func TestMalformedStoredRecordIsLogged(t *testing.T) {
 	if !strings.Contains(logs.String(), "invalid user role") {
 		t.Fatalf("cause was not logged: %q", logs.String())
 	}
+
+	// An update against the same record refuses to write on top of it.
+	logs.Reset()
+	response = callJSON(t, api, token, http.MethodPost, "/v1/auth/users/update", map[string]any{
+		"user_id": uid, "role": "reader",
+	})
+	if response.Code != http.StatusInternalServerError || responseCode(t, response) != "internal_error" {
+		t.Fatalf("update: status %d, body %s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(logs.String(), "malformed authentication record") {
+		t.Fatalf("update cause was not logged: %q", logs.String())
+	}
+	stored, err := api.auth.users.Get(uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Role != "sorcerer" {
+		t.Fatalf("a refused update still modified the record: %+v", stored)
+	}
 }

@@ -196,6 +196,28 @@ func TestTornWALTail(t *testing.T) {
 	}
 }
 
+// A torn first record leaves no complete record for replay to mark dirty.
+// Recovery must still remove it before appending: otherwise the next committed
+// record is glued to the fragment and the following Open sees corrupt JSON.
+func TestTornWALTailBeforeFirstRecordAllowsFutureWrites(t *testing.T) {
+	dir := t.TempDir()
+	walPath := filepath.Join(dir, "wal.log")
+	if err := os.WriteFile(walPath, []byte(`{"op":"set","coll":"docs"`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	db := openDB(t, dir, neverFlush...)
+	set(t, medb.C[int](db, "docs"), "kept", 42)
+	crashed := copyDir(t, dir)
+	closeDB(t, db)
+
+	db = openDB(t, crashed)
+	defer closeDB(t, db)
+	if got := get(t, medb.C[int](db, "docs"), "kept"); got != 42 {
+		t.Fatalf("kept = %d, want 42", got)
+	}
+}
+
 func TestCorruptWALRecord(t *testing.T) {
 	// A complete (newline-terminated) but malformed record is corruption,
 	// not a torn tail, and must fail loudly. Valid JSON with a bogus

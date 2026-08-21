@@ -84,24 +84,26 @@ func (db *DB) writeLog(err error) error {
 	return err
 }
 
-func readLog(path string) ([][]byte, error) {
+func readLog(path string) ([][]byte, int64, bool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, 0, false, err
 	}
 	var recs [][]byte
-	for {
-		i := bytes.IndexByte(data, '\n')
+	for offset := 0; offset < len(data); {
+		i := bytes.IndexByte(data[offset:], '\n')
 		if i < 0 {
-			return recs, nil
+			return recs, int64(offset), true, nil
 		}
-		recs = append(recs, data[:i])
-		data = data[i+1:]
+		i += offset
+		recs = append(recs, data[offset:i])
+		offset = i + 1
 	}
+	return recs, int64(len(data)), false, nil
 }
 
 func (db *DB) replayLog(path string) error {
-	recs, err := readLog(path)
+	recs, validSize, torn, err := readLog(path)
 	if err != nil {
 		return err
 	}
@@ -118,5 +120,14 @@ func (db *DB) replayLog(path string) error {
 		}
 		db.apply(rec)
 	}
+	if torn {
+		if err := db.log.Truncate(validSize); err != nil {
+			return fmt.Errorf("medb: truncate torn wal tail in %s: %w", path, err)
+		}
+		if err := db.log.Sync(); err != nil {
+			return fmt.Errorf("medb: sync truncated wal %s: %w", path, err)
+		}
+	}
+	db.size.Store(validSize)
 	return nil
 }

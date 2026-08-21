@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+
+	"github.com/antonmedv/medb/internal/fsutil"
 )
 
 type commit struct {
@@ -27,6 +30,12 @@ type file interface {
 func openLog(path string) (file, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
+		return nil, err
+	}
+	// Sync the containing directory so a successful WAL fsync cannot be
+	// followed by a power loss that forgets the wal.log directory entry.
+	if err := fsutil.SyncDir(filepath.Dir(path)); err != nil {
+		_ = f.Close()
 		return nil, err
 	}
 	return f, nil

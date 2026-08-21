@@ -56,7 +56,7 @@ func (db *DB) writeSnapshot(err error) error {
 
 func (db *DB) writeColl(name string, data []byte) error {
 	path := db.collPath(name)
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if err := fsutil.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
 	if err := fsutil.WriteFileAtomic(path, data); err != nil {

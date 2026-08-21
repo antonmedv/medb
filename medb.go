@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/antonmedv/medb/internal/fsutil"
 	"github.com/antonmedv/medb/internal/lock"
 )
 
@@ -25,6 +26,7 @@ var (
 	ErrLocked   = lock.ErrLocked
 	ErrClosed   = errors.New("medb: database is closed")
 	ErrTooLarge = errors.New("medb: document exceeds size limit")
+	ErrDirSync  = fsutil.ErrDirSync
 )
 
 type Option func(*options)
@@ -101,7 +103,7 @@ func Open(dir string, opts ...Option) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := fsutil.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
 	flock, err := lock.Acquire(filepath.Join(dir, lockName))

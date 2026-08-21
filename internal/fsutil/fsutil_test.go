@@ -119,4 +119,7 @@ func TestSyncDirMissing(t *testing.T) {
 	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("got %v, want ErrNotExist", err)
 	}
+	if !errors.Is(err, fsutil.ErrDirSync) {
+		t.Fatalf("got %v, want ErrDirSync", err)
+	}
 }

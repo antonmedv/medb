@@ -1,32 +1,38 @@
 #!/usr/bin/env python3
 """Render bench results (results.json) as a four-panel comparison chart."""
 
+import argparse
 import json
-import sys
+from math import log10
 
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.ticker import FuncFormatter
+from matplotlib.lines import Line2D
+from matplotlib.offsetbox import AnnotationBbox, DrawingArea, HPacker, TextArea
+from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter, NullLocator
 
 MEDB, PLAIN, FSYNC = "medb", "map+json", "map+json+fsync"
 
+# GitHub Primer canvas and foreground tokens, so the chart sits flush in the README.
 THEMES = {
     "light": {
-        "surface": "#fcfcfb",
-        "primary": "#0b0b0b",
-        "secondary": "#52514e",
-        "muted": "#8a8983",
-        "grid": "#e6e5e1",
+        "surface": "#ffffff",
+        "primary": "#1f2328",
+        "secondary": "#59636e",
+        "muted": "#818b98",
+        "grid": "#d8dee4",
+        "grid_minor": "#eff2f5",
         "series": {MEDB: "#2a78d6", PLAIN: "#eb6834", FSYNC: "#1baf7a"},
     },
     "dark": {
-        "surface": "#1a1a19",
-        "primary": "#ffffff",
-        "secondary": "#c3c2b7",
-        "muted": "#8a8983",
-        "grid": "#2f2f2c",
+        "surface": "#0d1117",
+        "primary": "#e6edf3",
+        "secondary": "#9198a1",
+        "muted": "#6e7681",
+        "grid": "#30363d",
+        "grid_minor": "#1b2028",
         "series": {MEDB: "#3987e5", PLAIN: "#d95926", FSYNC: "#199e70"},
     },
 }
@@ -50,99 +56,120 @@ def sizes_of_bytes(v, _=None):
     return f"{v:.0f} B"
 
 
-def crossover(xs, a, b):
-    """Size where series a drops below series b, interpolated in log-log space."""
-    from math import log10
-
-    for i in range(1, len(xs)):
-        if a[i - 1] > b[i - 1] and a[i] <= b[i]:
-            x0, x1 = log10(xs[i - 1]), log10(xs[i])
-            d0 = log10(a[i - 1]) - log10(b[i - 1])
-            d1 = log10(a[i]) - log10(b[i])
-            return 10 ** (x0 + (x1 - x0) * d0 / (d0 - d1))
-    return None
-
-
-def endpoint_labels(ax, t, series):
-    """Direct-label each line past its last point, nudged apart in log space."""
-    from math import log10
-
+def minor_y_labels(ax, fmt):
+    """Label the 2 and 5 minor ticks only where a decade-only axis reads too sparse."""
     lo, hi = ax.get_ylim()
-    span = log10(hi) - log10(lo)
-    items = sorted(
-        ((log10(ys[-1]), xs[-1], key) for key, xs, ys in series if ys[-1] > 0),
-        reverse=True,
+    ax.yaxis.set_minor_formatter(
+        FuncFormatter(fmt) if log10(hi / lo) < 2 else NullFormatter()
     )
-    placed = []
-    for y, x, key in items:
-        if placed and placed[-1][0] - y < 0.075 * span:
-            y = placed[-1][0] - 0.075 * span
-        placed.append((y, x, key))
-    for y, x, key in placed:
-        ax.text(
-            x * 1.18,
-            10**y,
-            LABEL[key],
-            color=t["series"][key],
-            fontsize=8.5,
-            va="center",
-            ha="left",
-        )
 
 
-def panel(ax, t, title, unit, xs, series, fmt, note=None):
-    ax.set_title(title, color=t["primary"], fontsize=11, loc="left", pad=12)
-    ax.text(
-        0,
-        1.015,
-        unit,
-        transform=ax.transAxes,
-        color=t["secondary"],
-        fontsize=8.5,
-        va="bottom",
-    )
+def panel(ax, t, title, xs, series, fmt):
+    ax.set_title(title, color=t["primary"], fontsize=11.5, loc="left", pad=10)
     for key, x, y in series:
+        hero = key == MEDB
         ax.plot(
             x,
             y,
             color=t["series"][key],
-            linewidth=1.8,
+            linewidth=2.4 if hero else 1.8,
             marker="o",
-            markersize=5.5,
+            markersize=6,
             markeredgecolor=t["surface"],
-            markeredgewidth=1.4,
+            markeredgewidth=1.8,
             solid_capstyle="round",
-            zorder=3 if key == MEDB else 2,
+            solid_joinstyle="round",
+            zorder=4 if hero else 3,
         )
     ax.set_xscale("log")
     ax.set_yscale("log")
-    ax.set_xlim(min(xs) / 1.9, max(xs) * 5.5)
+    ax.set_xlim(min(xs) / 2.0, max(xs) * 1.3)
     ax.set_xticks(xs)
     ax.xaxis.set_major_formatter(FuncFormatter(counts))
-    ax.xaxis.set_minor_formatter(lambda *_: "")
+    ax.xaxis.set_minor_locator(NullLocator())
     ax.yaxis.set_major_formatter(FuncFormatter(fmt))
-    ax.grid(True, which="major", color=t["grid"], linewidth=0.6)
+    ax.yaxis.set_minor_locator(LogLocator(base=10, subs=(2, 5)))
+    minor_y_labels(ax, fmt)
+    ax.grid(True, which="major", color=t["grid"], linewidth=0.7)
+    ax.grid(True, which="minor", color=t["grid_minor"], linewidth=0.7)
     ax.set_axisbelow(True)
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
     for side in ("left", "bottom"):
         ax.spines[side].set_color(t["grid"])
         ax.spines[side].set_linewidth(0.8)
-    ax.tick_params(colors=t["secondary"], labelsize=8.5, length=0, which="both")
-    endpoint_labels(ax, t, series)
-    if note:
-        x, text = note
-        ax.axvline(x, color=t["muted"], linewidth=0.8, zorder=1)
-        ax.annotate(
-            text,
-            xy=(x, ax.get_ylim()[1]),
-            xytext=(-4, -2),
-            textcoords="offset points",
-            color=t["secondary"],
-            fontsize=8,
-            ha="right",
-            va="top",
+    ax.tick_params(which="both", length=0, labelsize=8.5)
+    ax.tick_params(which="major", colors=t["secondary"])
+    ax.tick_params(which="minor", colors=t["muted"])
+
+
+def endpoint_labels(fig, ax, t, series):
+    """Direct-label each line at its end, each label keyed by its own color rule."""
+    ends = [(k, x[-1], y[-1]) for k, x, y in series if y[-1] > 0]
+    ranked = sorted(
+        ((ax.transData.transform((x, y))[1], k, x, y) for k, x, y in ends), reverse=True
+    )
+    px = fig.dpi / 72.0
+    tops, prev = [], None
+    for top, *_ in ranked:
+        if prev is not None and prev - top < 15 * px:
+            top = prev - 15 * px
+        prev = top
+        tops.append(top)
+    center = sum(top - r[0] for top, r in zip(tops, ranked)) / len(tops)
+    boxes = []
+    for top, (natural, key, x, y) in zip(tops, ranked):
+        rule = DrawingArea(11, 3, 0, 0)
+        rule.add_artist(
+            Line2D(
+                [0, 11],
+                [1.5, 1.5],
+                color=t["series"][key],
+                linewidth=2.2,
+                solid_capstyle="round",
+            )
         )
+        box = AnnotationBbox(
+            HPacker(
+                children=[
+                    rule,
+                    TextArea(
+                        LABEL[key], textprops=dict(color=t["primary"], fontsize=8.5)
+                    ),
+                ],
+                pad=0,
+                sep=4,
+                align="center",
+            ),
+            (x, y),
+            xybox=(10, (top - center - natural) / px),
+            xycoords="data",
+            boxcoords="offset points",
+            box_alignment=(0, 0.5),
+            frameon=False,
+            pad=0,
+            annotation_clip=False,
+            zorder=6,
+        )
+        ax.add_artist(box)
+        boxes.append(box)
+    return boxes
+
+
+def fit_x_range(fig, panels, labels, xs):
+    """One x range for every panel, wide enough for the widest set of end labels."""
+    renderer = fig.canvas.get_renderer()
+    reach = max(
+        box.get_window_extent(renderer).x1 - ax.transData.transform((xs[-1], 1))[0]
+        for ax, *_ in panels
+        for box in labels[ax]
+    )
+    width = min(ax.get_window_extent().width for ax, *_ in panels)
+    room = width - reach - 6 * fig.dpi / 72.0
+    lo = min(xs) / 2.0
+    hi = 10 ** (log10(lo) + (log10(xs[-1]) - log10(lo)) * width / room)
+    for ax, *_ in panels:
+        ax.set_xlim(lo, hi)
 
 
 def render(rows, theme, out):
@@ -154,8 +181,6 @@ def render(rows, theme, out):
     def s(field, keys=stores):
         return [(k, xs, [by[(k, n)][field] for n in xs]) for k in keys]
 
-    seq = {k: [by[(k, n)]["writes_per_sec"] for n in xs] for k in stores}
-    par = {k: [by[(k, n)]["par_writes_per_sec"] for n in xs] for k in stores}
     writers = by[(MEDB, xs[0])]["writers"]
 
     plt.rcParams["font.family"] = [
@@ -164,91 +189,58 @@ def render(rows, theme, out):
         "Arial",
         "DejaVu Sans",
     ]
-    fig, axes = plt.subplots(2, 2, figsize=(11.5, 8.6), dpi=110)
+    fig, axes = plt.subplots(2, 2, figsize=(11.2, 8.0), dpi=200)
     fig.patch.set_facecolor(t["surface"])
     for ax in axes.flat:
         ax.set_facecolor(t["surface"])
 
-    x1 = crossover(xs, seq[PLAIN], seq[MEDB])
-    x2 = crossover(xs, par[PLAIN], par[MEDB])
-    panel(
-        axes[0][0],
-        t,
-        "Writes per second — one writer",
-        "higher is better · log scale",
-        xs,
-        s("writes_per_sec"),
-        counts,
-        (x1, f"medb ahead past ~{counts(x1)} docs  ") if x1 else None,
+    panels = [
+        (axes[0][0], "Writes per second — one writer", s("writes_per_sec"), counts),
+        (
+            axes[0][1],
+            f"Writes per second — {writers} concurrent writers",
+            s("par_writes_per_sec"),
+            counts,
+        ),
+        (
+            axes[1][0],
+            "Bytes written per change",
+            s("bytes_per_write", [MEDB, PLAIN]),
+            sizes_of_bytes,
+        ),
+        (axes[1][1], "Reads per second", s("reads_per_sec", [MEDB, PLAIN]), counts),
+    ]
+
+    fig.subplots_adjust(
+        left=0.058, right=0.982, top=0.878, bottom=0.115, hspace=0.30, wspace=0.17
     )
-    panel(
-        axes[0][1],
-        t,
-        f"Writes per second — {writers} concurrent writers",
-        "higher is better · log scale",
-        xs,
-        s("par_writes_per_sec"),
-        counts,
-        (x2, f"medb ahead past ~{counts(x2)} docs  ") if x2 else None,
-    )
-    panel(
-        axes[1][0],
-        t,
-        "Bytes written to disk per change",
-        "lower is better · log scale · fsync does not change the byte count",
-        xs,
-        s("bytes_per_write", [MEDB, PLAIN]),
-        sizes_of_bytes,
-    )
-    panel(
-        axes[1][1],
-        t,
-        "Reads per second",
-        "higher is better · log scale · both map variants share one line",
-        xs,
-        s("reads_per_sec", [MEDB, PLAIN]),
-        counts,
-    )
-    for ax in axes[1]:
-        ax.set_xlabel("documents in collection", color=t["secondary"], fontsize=8.5)
+    for ax, title, series, fmt in panels:
+        panel(ax, t, title, xs, series, fmt)
+
+    writes = [ax for ax, *_ in panels[:2]]
+    span = [ax.get_ylim() for ax in writes]
+    for ax in writes:
+        ax.set_ylim(min(lo for lo, _ in span), max(hi for _, hi in span))
+        minor_y_labels(ax, counts)
+
+    fig.canvas.draw()
+    fit_x_range(fig, panels, {ax: endpoint_labels(fig, ax, t, series) for ax, _, series, _ in panels}, xs)
 
     fig.suptitle(
-        "MeDB vs. a map rewritten to a JSON file on every change",
+        "MeDB's write cost is flat; rewriting a JSON file grows with the collection",
         color=t["primary"],
-        fontsize=15,
-        x=0.055,
-        y=0.975,
+        fontsize=16,
+        x=0.058,
+        y=0.955,
         ha="left",
     )
     fig.text(
-        0.055,
-        0.938,
-        "steady-state writes that replace an existing document · "
-        "map+json does not fsync, so its writes are not durable · "
-        "medb and map+json+fsync are durable",
+        0.52,
+        0.042,
+        "documents in collection",
         color=t["secondary"],
-        fontsize=9,
-        ha="left",
-    )
-    handles = [
-        plt.Line2D([], [], color=t["series"][k], linewidth=2.2, label=LABEL[k])
-        for k in stores
-    ]
-    leg = fig.legend(
-        handles=handles,
-        loc="upper right",
-        bbox_to_anchor=(0.985, 0.985),
-        ncols=3,
-        frameon=False,
-        fontsize=9,
-        handlelength=1.4,
-        columnspacing=1.6,
-    )
-    for text in leg.get_texts():
-        text.set_color(t["secondary"])
-
-    fig.subplots_adjust(
-        left=0.055, right=0.948, top=0.855, bottom=0.075, hspace=0.36, wspace=0.24
+        fontsize=8.5,
+        ha="center",
     )
     for ext in ("svg", "png"):
         fig.savefig(f"{out}.{ext}", facecolor=t["surface"])
@@ -256,8 +248,10 @@ def render(rows, theme, out):
 
 
 def main():
-    path = sys.argv[1] if len(sys.argv) > 1 else "results.json"
-    rows = json.load(open(path))
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("results", nargs="?", default="results.json")
+    args = p.parse_args()
+    rows = json.load(open(args.results))
     render(rows, "light", "bench")
     render(rows, "dark", "bench-dark")
     print("wrote bench.svg bench.png bench-dark.svg bench-dark.png")

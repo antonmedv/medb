@@ -97,6 +97,10 @@ func Open(dir string, opts ...Option) (*DB, error) {
 	if err := o.validate(); err != nil {
 		return nil, err
 	}
+	dir, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
@@ -107,12 +111,12 @@ func Open(dir string, opts ...Option) (*DB, error) {
 	logPath := filepath.Join(dir, walName)
 	log, err := openLog(logPath)
 	if err != nil {
-		_ = lock.Release(flock)
+		flock.Close()
 		return nil, err
 	}
 	db := &DB{
 		flock:   flock,
-		dir:     filepath.Clean(dir),
+		dir:     dir,
 		opts:    o,
 		colls:   map[string]map[string]json.RawMessage{},
 		dirty:   map[string]bool{},
@@ -122,15 +126,15 @@ func Open(dir string, opts ...Option) (*DB, error) {
 		stop:    make(chan struct{}),
 	}
 	if err := db.load(); err != nil {
-		_ = lock.Release(flock)
+		flock.Close()
 		return nil, err
 	}
 	if err := db.replayLog(logPath); err != nil {
-		_ = lock.Release(flock)
+		flock.Close()
 		return nil, err
 	}
 	if err := db.writeSnapshot(nil); err != nil {
-		_ = lock.Release(flock)
+		flock.Close()
 		return nil, err
 	}
 	db.done.Add(1)
@@ -154,7 +158,7 @@ func (db *DB) Close() error {
 	if e := db.log.Close(); err == nil {
 		err = e
 	}
-	if e := lock.Release(db.flock); err == nil {
+	if e := db.flock.Close(); err == nil {
 		err = e
 	}
 

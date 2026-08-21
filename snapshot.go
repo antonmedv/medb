@@ -17,21 +17,25 @@ func (db *DB) writeSnapshot(err error) error {
 		return err
 	}
 	db.mu.Lock()
+	if len(db.dirty) == 0 && len(db.dropped) == 0 && db.size.Load() == 0 {
+		db.mu.Unlock()
+		return nil
+	}
 	dirty, dropped := db.dirty, db.dropped
 	db.dirty, db.dropped = map[string]bool{}, map[string]bool{}
-	db.mu.Unlock()
-	db.mu.RLock()
-	defer db.mu.RUnlock()
+	snaps := make(map[string][]byte, len(dirty))
 	for name := range dirty {
-		coll, ok := db.colls[name]
-		if !ok {
-			continue
-		}
-		b, err := json.Marshal(coll)
+		b, err := json.Marshal(db.colls[name])
 		if err != nil {
+			db.mu.Unlock()
 			return err
 		}
-		if err := db.writeColl(name, b); err != nil {
+		snaps[name] = b
+	}
+	db.mu.Unlock()
+
+	for name, data := range snaps {
+		if err := db.writeColl(name, data); err != nil {
 			return err
 		}
 	}

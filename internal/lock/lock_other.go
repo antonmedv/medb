@@ -9,7 +9,3 @@ import (
 func Acquire(path string) (*os.File, error) {
 	return nil, ErrNotSupported
 }
-
-func Release(f *os.File) error {
-	return ErrNotSupported
-}

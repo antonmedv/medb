@@ -2,6 +2,8 @@ package medb_test
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -293,6 +295,95 @@ func TestForeignFilesIgnored(t *testing.T) {
 		if err != nil || string(data) != "keep me" {
 			t.Fatalf("foreign file %s damaged: %q, %v", name, data, err)
 		}
+	}
+}
+
+// Open must pin the directory it was given. A relative dir plus a later
+// os.Chdir used to send the snapshot into the new working directory, truncate
+// the original WAL to zero.
+func TestRelativeDirSurvivesChdir(t *testing.T) {
+	root, elsewhere := t.TempDir(), t.TempDir()
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(cwd); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+
+	db := openDB(t, "data", neverFlush...)
+	set(t, medb.C[string](db, "users"), "id", "acked")
+	if err := os.Chdir(elsewhere); err != nil {
+		t.Fatal(err)
+	}
+	closeDB(t, db) // must not report "remove data/lock: no such file or directory"
+
+	if ents, err := os.ReadDir(elsewhere); err != nil || len(ents) != 0 {
+		t.Fatalf("Close wrote into the new working directory: %v, %v", ents, err)
+	}
+	dir := filepath.Join(root, "data")
+	if err := os.Chdir(cwd); err != nil {
+		t.Fatal(err)
+	}
+	db = openDB(t, dir)
+	defer closeDB(t, db)
+	if got := get(t, medb.C[string](db, "users"), "id"); got != "acked" {
+		t.Fatalf("got %q, want %q", got, "acked")
+	}
+}
+
+// A collection untouched since its last flush must not be rewritten by
+// later flushes — snapshot I/O is proportional to what changed, not to the
+// whole database.
+func TestSnapshotRewritesOnlyDirtyCollections(t *testing.T) {
+	dir := t.TempDir()
+	db := openDB(t, dir, medb.WithFlushInterval(30*time.Millisecond))
+	defer closeDB(t, db)
+
+	cold := medb.C[User](db, "cold")
+	hot := medb.C[User](db, "hot")
+	set(t, cold, "c1", User{Name: "cold"})
+	set(t, hot, "h0", User{Name: "hot"})
+
+	// Wait for the flush that persists both collections.
+	coldPath := filepath.Join(dir, "cold.json")
+	hotPath := filepath.Join(dir, "hot.json")
+	waitFor(t, 5*time.Second, func() bool {
+		_, err1 := os.Stat(coldPath)
+		_, err2 := os.Stat(hotPath)
+		return err1 == nil && err2 == nil
+	})
+	coldStat, err := os.Stat(coldPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Drive at least three more flushes by keeping hot dirty and waiting
+	// for each write to reach its snapshot file.
+	for i := 1; i <= 3; i++ {
+		id := fmt.Sprintf("h%d", i)
+		set(t, hot, id, User{Age: i})
+		waitFor(t, 5*time.Second, func() bool {
+			data, err := os.ReadFile(hotPath)
+			if err != nil {
+				return false
+			}
+			var coll map[string]User
+			return json.Unmarshal(data, &coll) == nil && coll[id].Age == i
+		})
+	}
+
+	after, err := os.Stat(coldPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ModTime().Equal(coldStat.ModTime()) {
+		t.Fatal("clean collection was rewritten by a flush it took no part in")
 	}
 }
 

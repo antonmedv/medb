@@ -322,6 +322,33 @@ func TestPowerLossDurability(t *testing.T) {
 	}
 }
 
+// A flush with nothing to do must do nothing: no WAL truncate, no fsync.
+// Otherwise an idle database pays one fsync per flush interval forever.
+// writeSnapshot is called directly (the run goroutine is parked on an
+// hour-long ticker, so there is no concurrent WAL access to race with).
+func TestSnapshotSkipsWhenClean(t *testing.T) {
+	fl := &flakyLog{}
+	db := openFlaky(t, t.TempDir(), fl)
+	defer func() { _ = db.Close() }()
+
+	if err := C[int](db, "users").Set("a", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.writeSnapshot(nil); err != nil { // flushes the write
+		t.Fatal(err)
+	}
+	base := fl.syncs.Load()
+
+	for range 5 {
+		if err := db.writeSnapshot(nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := fl.syncs.Load(); got != base {
+		t.Fatalf("%d clean flushes synced the WAL %d times, want 0", 5, got-base)
+	}
+}
+
 // Group commit must batch: N concurrent writers may not pay N fsyncs.
 func TestGroupCommitBatchesSyncs(t *testing.T) {
 	fl := &flakyLog{syncDelay: time.Millisecond}

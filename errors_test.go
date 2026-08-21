@@ -171,6 +171,29 @@ func TestInvalidNamePanics(t *testing.T) {
 	})
 }
 
+// The bound is only useful if everything under it works: the longest accepted
+// name, flat and nested, must snapshot and reload.
+func TestLongestValidNames(t *testing.T) {
+	valid := []string{
+		strings.Repeat("a", 240),
+		strings.Repeat("b", 120) + "/" + strings.Repeat("c", 119),
+	}
+	dir := t.TempDir()
+	db := openDB(t, dir)
+	for _, name := range valid {
+		set(t, medb.C[string](db, name), "id", name)
+	}
+	closeDB(t, db)
+
+	db = openDB(t, dir)
+	defer closeDB(t, db)
+	for _, name := range valid {
+		if got := get(t, medb.C[string](db, name), "id"); got != name {
+			t.Fatalf("collection of %d bytes: got %q", len(name), got)
+		}
+	}
+}
+
 func TestUnusualValidNames(t *testing.T) {
 	valid := []string{"a", "0", "-", "_", "a-b_c9", "a/b/c", "0/1"}
 	dir := t.TempDir()

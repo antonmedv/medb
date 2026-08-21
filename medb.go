@@ -224,7 +224,15 @@ func (db *DB) collPath(name string) string {
 	return filepath.Join(db.dir, filepath.FromSlash(name)+".json")
 }
 
+// maxNameLen bounds a collection name so that its snapshot path is always
+// writable: the name plus the ".json.tmp" suffix of an atomic write has to fit
+// in a single filesystem component (255 bytes on ext4, APFS and NTFS).
+const maxNameLen = 240
+
 func validName(name string) bool {
+	if len(name) > maxNameLen {
+		return false
+	}
 	seg := 0
 	for i := range len(name) {
 		switch c := name[i]; {

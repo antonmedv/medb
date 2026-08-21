@@ -64,6 +64,27 @@ users := db.C[User]("users")
 The package-level `medb.C` function remains available on every supported Go
 version.
 
+## Benchmarks
+
+Rewriting a JSON file on every change, the way the story above starts, costs the whole collection per write.
+MeDB appends one log record instead.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="bench/bench-dark.png">
+  <img alt="MeDB against a map rewritten to a JSON file on every change" src="bench/bench.png">
+</picture>
+
+- MeDB holds ~245 writes/s and 4 ms p50 from 10 to 100k documents. The rewrite falls from 30k writes/s to 43,
+  because one change grew from 411 B to 4.5 MB.
+- A durable write costs one fsync (~4 ms here), so with a single writer the rewrite is ahead below ~20k
+  documents. A map with fsync hits the same floor: that gap is durability, not MeDB.
+- With 64 writers MeDB batches them onto one fsync: ~7.8k writes/s at every size, 187x the rewrite at 100k
+  documents, ahead past ~440.
+- Reads are the trade: 2.6-4.5M/s against 31-100M/s, because `Get` unmarshals the stored JSON.
+
+Measured on an Apple M4 Pro with APFS, where fsync is `F_FULLFSYNC`. Method, full table and harness:
+[bench](bench/).
+
 ## License
 
 [MIT](LICENSE)

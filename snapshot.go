@@ -35,7 +35,11 @@ func (db *DB) writeSnapshot(err error) error {
 	db.mu.Unlock()
 
 	for name, data := range snaps {
-		if err := db.writeColl(name, data); err != nil {
+		path := db.collPath(name)
+		if err := fsutil.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return err
+		}
+		if err := fsutil.WriteFileAtomic(path, data); err != nil {
 			return err
 		}
 	}
@@ -54,17 +58,6 @@ func (db *DB) writeSnapshot(err error) error {
 	return nil
 }
 
-func (db *DB) writeColl(name string, data []byte) error {
-	path := db.collPath(name)
-	if err := fsutil.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	if err := fsutil.WriteFileAtomic(path, data); err != nil {
-		return err
-	}
-	return nil
-}
-
 func (db *DB) removeColl(name string) error {
 	path := db.collPath(name)
 	switch err := os.Remove(path); {
@@ -79,7 +72,7 @@ func (db *DB) removeColl(name string) error {
 }
 
 func (db *DB) load() error {
-	err := filepath.WalkDir(db.dir, func(path string, d fs.DirEntry, err error) error {
+	return filepath.WalkDir(db.dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
 			return err
 		}
@@ -102,8 +95,4 @@ func (db *DB) load() error {
 		db.colls[name] = c
 		return nil
 	})
-	if err != nil {
-		return err
-	}
-	return nil
 }

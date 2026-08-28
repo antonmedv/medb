@@ -1,6 +1,15 @@
+// Package medb provides a small embedded document database.
+//
+// A database keeps documents in memory and stores them as JSON on disk. It
+// writes every successful change to a durable log before returning. All DB and
+// Collection methods are safe to call from concurrent goroutines. Only one
+// process can open a database directory at a time. Callers can use errors.Is to
+// test the sentinel errors exposed by this package.
 package medb
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -227,7 +236,10 @@ func (db *DB) Collections() []string {
 // a valid collection name; see [C].
 func (db *DB) Drop(name string) error {
 	mustValidName(name)
-	rec := record{Op: opDrop, Coll: name}
+	return db.write(record{Op: opDrop, Coll: name})
+}
+
+func (db *DB) write(rec record) error {
 	buf, err := json.Marshal(rec)
 	if err != nil {
 		return err
@@ -241,6 +253,19 @@ func (db *DB) Drop(name string) error {
 	commit := db.enqueue(buf)
 	db.mu.Unlock()
 	return commit.wait()
+}
+
+func (db *DB) read(coll, id string) (json.RawMessage, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return nil, ErrClosed
+	}
+	raw, ok := db.colls[coll][id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return raw, nil
 }
 
 func (db *DB) run() {
@@ -306,4 +331,14 @@ func mustValidName(name string) {
 	if !validName(name) {
 		panic(fmt.Sprintf("medb: invalid collection name %q", name))
 	}
+}
+
+// NewID returns a random 128-bit identifier as 32 lowercase hexadecimal
+// characters. It panics if the system cannot provide secure random bytes.
+func NewID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(err)
+	}
+	return hex.EncodeToString(b[:])
 }

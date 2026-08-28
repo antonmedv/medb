@@ -36,15 +36,9 @@ func C[T any](db *DB, name string) *Collection[T] {
 // T.
 func (c *Collection[T]) Get(id string) (T, error) {
 	var zero T
-	c.db.mu.RLock()
-	if c.db.closed {
-		c.db.mu.RUnlock()
-		return zero, ErrClosed
-	}
-	raw, ok := c.db.colls[c.name][id]
-	c.db.mu.RUnlock()
-	if !ok {
-		return zero, ErrNotFound
+	raw, err := c.db.read(c.name, id)
+	if err != nil {
+		return zero, err
 	}
 	var v T
 	if err := json.Unmarshal(raw, &v); err != nil {
@@ -65,40 +59,14 @@ func (c *Collection[T]) Set(id string, doc T) error {
 	if err := c.db.checkDocSize(raw); err != nil {
 		return err
 	}
-	rec := record{Op: opSet, Coll: c.name, ID: id, Doc: raw}
-	buf, err := json.Marshal(rec)
-	if err != nil {
-		return err
-	}
-	c.db.mu.Lock()
-	if c.db.closed {
-		c.db.mu.Unlock()
-		return ErrClosed
-	}
-	c.db.apply(rec)
-	commit := c.db.enqueue(buf)
-	c.db.mu.Unlock()
-	return commit.wait()
+	return c.db.write(record{Op: opSet, Coll: c.name, ID: id, Doc: raw})
 }
 
 // Delete removes the document with id. It does nothing if the document does
 // not exist. A successful return means the change is durable. Delete returns
 // [ErrClosed] if the database has closed.
 func (c *Collection[T]) Delete(id string) error {
-	rec := record{Op: opDel, Coll: c.name, ID: id}
-	buf, err := json.Marshal(rec)
-	if err != nil {
-		return err
-	}
-	c.db.mu.Lock()
-	if c.db.closed {
-		c.db.mu.Unlock()
-		return ErrClosed
-	}
-	c.db.apply(rec)
-	commit := c.db.enqueue(buf)
-	c.db.mu.Unlock()
-	return commit.wait()
+	return c.db.write(record{Op: opDel, Coll: c.name, ID: id})
 }
 
 // Update replaces the document with the value returned by fn. It returns
@@ -111,56 +79,53 @@ func (c *Collection[T]) Delete(id string) error {
 // Update blocks other operations on the database while fn runs. Keep fn short,
 // and do not call methods on the same database from fn.
 func (c *Collection[T]) Update(id string, fn func(T) (T, error)) error {
-	commit, err := func() (*commit, error) {
-		c.db.mu.Lock()
-		defer c.db.mu.Unlock()
-
-		if c.db.closed {
-			return nil, ErrClosed
-		}
-		raw, ok := c.db.colls[c.name][id]
-		if !ok {
-			return nil, ErrNotFound
-		}
-		var v T
-		if err := json.Unmarshal(raw, &v); err != nil {
-			return nil, err
-		}
-		v, err := fn(v)
-		if err != nil {
-			return nil, err
-		}
-		out, err := json.Marshal(v)
-		if err != nil {
-			return nil, err
-		}
-		if err := c.db.checkDocSize(out); err != nil {
-			return nil, err
-		}
-
-		rec := record{Op: opSet, Coll: c.name, ID: id, Doc: out}
-		buf, err := json.Marshal(rec)
-		if err != nil {
-			return nil, err
-		}
-		c.db.apply(rec)
-		return c.db.enqueue(buf), nil
-	}()
+	commit, err := c.update(id, fn)
 	if err != nil {
 		return err
 	}
 	return commit.wait()
 }
 
+func (c *Collection[T]) update(id string, fn func(T) (T, error)) (*commit, error) {
+	c.db.mu.Lock()
+	defer c.db.mu.Unlock()
+
+	if c.db.closed {
+		return nil, ErrClosed
+	}
+	raw, ok := c.db.colls[c.name][id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	var v T
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil, err
+	}
+	v, err := fn(v)
+	if err != nil {
+		return nil, err
+	}
+	out, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.db.checkDocSize(out); err != nil {
+		return nil, err
+	}
+
+	rec := record{Op: opSet, Coll: c.name, ID: id, Doc: out}
+	buf, err := json.Marshal(rec)
+	if err != nil {
+		return nil, err
+	}
+	c.db.apply(rec)
+	return c.db.enqueue(buf), nil
+}
+
 // Has reports whether id exists. It reports false after the database closes.
 func (c *Collection[T]) Has(id string) bool {
-	c.db.mu.RLock()
-	defer c.db.mu.RUnlock()
-	if c.db.closed {
-		return false
-	}
-	_, ok := c.db.colls[c.name][id]
-	return ok
+	_, err := c.db.read(c.name, id)
+	return err == nil
 }
 
 // Count returns the number of documents in the collection. It returns zero

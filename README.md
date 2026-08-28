@@ -19,6 +19,16 @@ memory, stored as JSON on disk, without losing records if the process crashes.
 
 ## Usage
 
+## Usage
+
+Install MeDB:
+
+```sh
+go get github.com/antonmedv/medb
+```
+
+### Quick start
+
 ```go
 package main
 
@@ -29,8 +39,8 @@ import (
 )
 
 type User struct {
-	Name string
-	Age  int
+	Name string `json:"name"`
+	Age  int    `json:"age"`
 }
 
 func main() {
@@ -54,9 +64,123 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+
 	fmt.Printf("%s is %d years old\n", user.Name, user.Age)
 }
 ```
+
+This creates a `users` collection backed by `data/users.json`. Collections are typed views over JSON data, so use a compatible Go type whenever you reopen the same collection.
+
+Collection names may contain nested paths:
+
+```go
+users := medb.C[User](db, "prod/eu/users")
+```
+
+This collection is stored as `data/prod/eu/users.json`.
+
+### Updating documents
+
+Use `Update` when the new value depends on the current document:
+
+```go
+err := users.Update("ada", func(user User) (User, error) {
+	user.Age++
+	return user, nil
+})
+if err != nil {
+	panic(err)
+}
+```
+
+`Update` prevents read-modify-write races between goroutines. Keep the callback short and do not call other methods on the same database from inside it.
+
+### IDs, checks, and iteration
+
+```go
+id := medb.NewID()
+
+if err := users.Set(id, User{Name: "Grace", Age: 45}); err != nil {
+	panic(err)
+}
+
+fmt.Println(users.Has(id))
+fmt.Println(users.Count())
+
+for id, user := range users.All() {
+	fmt.Printf("%s: %s\n", id, user.Name)
+}
+```
+
+`NewID` returns a random 128-bit hexadecimal identifier. `All` iterates over a stable snapshot of the collection, ordered by document ID.
+
+### Deleting data
+
+Delete one document:
+
+```go
+if err := users.Delete("ada"); err != nil {
+	panic(err)
+}
+```
+
+List and remove entire collections:
+
+```go
+for _, name := range db.Collections() {
+	fmt.Println(name)
+}
+
+if err := db.Drop("users"); err != nil {
+	panic(err)
+}
+```
+
+Deleting a missing document or collection is a no-op. Successful `Set`, `Update`, `Delete`, and `Drop` calls are durable when they return.
+
+### Error handling
+
+MeDB exposes sentinel errors that can be checked with `errors.Is`:
+
+```go
+user, err := users.Get("missing")
+
+switch {
+case errors.Is(err, medb.ErrNotFound):
+	fmt.Println("user not found")
+case err != nil:
+	panic(err)
+default:
+	fmt.Println(user)
+}
+```
+
+Other sentinel errors include:
+
+- `ErrLocked` when another process has already opened the database directory.
+- `ErrClosed` when an operation is attempted after `Close`.
+- `ErrTooLarge` when a document exceeds the configured size limit.
+- `ErrDirSync` when a filesystem directory change cannot be made durable.
+
+MeDB is safe to use from multiple goroutines, but a database directory can be opened by only one process at a time.
+
+### Configuration
+
+Database options can control document size and when JSON snapshots are written:
+
+```go
+db, err := medb.Open(
+	"data",
+	medb.WithMaxDocSize(4<<20),          // 4 MiB per document
+	medb.WithFlushBytes(16<<20),         // snapshot at 16 MiB of WAL
+	medb.WithFlushInterval(time.Second), // snapshot changed collections every second
+)
+if err != nil {
+	panic(err)
+}
+```
+
+`WithFlushBytes` and `WithFlushInterval` control snapshot timing, not write durability. Every successful change is synced to the write-ahead log before returning.
 
 Go 1.27 and newer also support the equivalent method syntax:
 

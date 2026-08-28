@@ -1,18 +1,20 @@
 # MeDB
+
 [![GoDoc](https://godoc.org/antonmedv/medb?status.svg)](https://godoc.org/github.com/antonmedv/medb)
 
+## Features
+
+- In-memory DB with persistence on disk.
+- WAL and full durability of writes.
+- Optional [MeDB server](cmd/medb/README.md)
+  - Simple HTTP API 
+  - Roles and token authentication.
+
+## Rationale
+
 I was building a simple Go server and kept users in a map. I wanted to save them to disk, but a full database felt like
-too much, so I just wrote the map to a JSON file. It worked, but I wanted the same simplicity with durability. A map in memory, stored as JSON on disk, without losing
-records if the process crashes.
-
-That is how this database was born. MeDB is a small embedded in memory database that persists data to JSON files on disk.
-
-1. Writes are durable: acknowledged writes are fsynced.
-2. Data is stored as JSON files.
-3. Only one process can open the database at a time.
-4. Concurrent reads/writes are safe.
-
-The optional [MeDB server](cmd/medb/README.md) exposes the database over HTTP with JSON, token authentication, and roles.
+too much, so I just wrote the map to a JSON file. It worked, but I wanted the same simplicity with durability. A map in
+memory, stored as JSON on disk, without losing records if the process crashes.
 
 ## Usage
 
@@ -61,29 +63,29 @@ Go 1.27 and newer also support the equivalent method syntax:
 users := db.C[User]("users")
 ```
 
-The package-level `medb.C` function remains available on every supported Go
-version.
+The package-level `medb.C` function remains available on every supported Go version.
 
 ## Benchmarks
 
-Rewriting a JSON file on every change, the way the story above starts, costs the whole collection per write.
-MeDB appends one log record instead.
+Rewriting the entire JSON file on every update gets more expensive as the collection grows. MeDB writes a small log
+entry instead.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="bench/bench-dark.png">
-  <img alt="MeDB against a map rewritten to a JSON file on every change" src="bench/bench.png">
+  <img alt="MeDB compared with rewriting a JSON file on every update" src="bench/bench.png">
 </picture>
 
-- MeDB holds ~245 writes/s and 4 ms p50 from 10 to 100k documents. The rewrite falls from 30k writes/s to 43,
-  because one change grew from 411 B to 4.5 MB.
-- A durable write costs one fsync (~4 ms here), so with a single writer the rewrite is ahead below ~20k
-  documents. A map with fsync hits the same floor: that gap is durability, not MeDB.
-- With 64 writers MeDB batches them onto one fsync: ~7.8k writes/s at every size, 187x the rewrite at 100k
-  documents, ahead past ~440.
-- Reads are the trade: 2.6-4.5M/s against 31-100M/s, because `Get` unmarshals the stored JSON.
+- **Single writer:** MeDB stays near 245 writes/s with a 4 ms p50, from 10 to 100k documents. Full-file rewriting drops
+  from 30k writes/s to 43 as each update grows from 411 B to 4.5 MB.
+- **Durability has a cost:** each committed write requires an `fsync`—about 4 ms on this machine. That is why the
+  rewrite is faster below roughly 20k documents when it does not use `fsync`. Add `fsync`, and it reaches the same limit
+  as MeDB.
+- **Concurrent writes are batched:** with 64 writers, MeDB combines multiple writes into one `fsync` and sustains about
+  7.8k writes/s at every collection size. It overtakes the rewrite at roughly 440 documents and is 187× faster at 100k.
+- **Reads are the trade-off:** MeDB handles 2.6–4.5M reads/s, compared with 31–100M for an in-memory map, because `Get`
+  must unmarshal the stored JSON.
 
-Measured on an Apple M4 Pro with APFS, where fsync is `F_FULLFSYNC`. Method, full table and harness:
-[bench](bench/).
+Measured on an Apple M4 Pro with APFS, where `fsync` uses `F_FULLFSYNC`. See the [bench](bench/).
 
 ## License
 

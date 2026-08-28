@@ -84,51 +84,41 @@ func (db *DB) writeLog(err error) error {
 	return err
 }
 
-func readLog(path string) ([][]byte, int64, bool, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, 0, false, err
-	}
-	var recs [][]byte
-	for offset := 0; offset < len(data); {
-		i := bytes.IndexByte(data[offset:], '\n')
-		if i < 0 {
-			return recs, int64(offset), true, nil
-		}
-		i += offset
-		recs = append(recs, data[offset:i])
-		offset = i + 1
-	}
-	return recs, int64(len(data)), false, nil
-}
-
 func (db *DB) replayLog(path string) error {
-	recs, validSize, torn, err := readLog(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	for i, payload := range recs {
+	// A record counts only once its terminating newline is on disk, so the
+	// bytes after the last newline are a torn tail and get truncated away.
+	var size int64
+	for n := 1; ; n++ {
+		i := bytes.IndexByte(data[size:], '\n')
+		if i < 0 {
+			break
+		}
 		var rec record
-		if err := json.Unmarshal(payload, &rec); err != nil {
-			return fmt.Errorf("medb: corrupt wal record %d in %s: %w", i+1, path, err)
+		if err := json.Unmarshal(data[size:size+int64(i)], &rec); err != nil {
+			return fmt.Errorf("medb: corrupt wal record %d in %s: %w", n, path, err)
 		}
 		if !validName(rec.Coll) {
-			return fmt.Errorf("medb: corrupt wal record %d in %s: invalid collection name %q", i+1, path, rec.Coll)
+			return fmt.Errorf("medb: corrupt wal record %d in %s: invalid collection name %q", n, path, rec.Coll)
 		}
 		if rec.Op == opSet && len(rec.Doc) == 0 {
-			return fmt.Errorf("medb: corrupt wal record %d in %s: set record without doc", i+1, path)
+			return fmt.Errorf("medb: corrupt wal record %d in %s: set record without doc", n, path)
 		}
 		db.apply(rec)
+		size += int64(i) + 1
 	}
-	if torn {
-		if err := db.log.Truncate(validSize); err != nil {
+	if size < int64(len(data)) {
+		if err := db.log.Truncate(size); err != nil {
 			return fmt.Errorf("medb: truncate torn wal tail in %s: %w", path, err)
 		}
 		if err := db.log.Sync(); err != nil {
 			return fmt.Errorf("medb: sync truncated wal %s: %w", path, err)
 		}
 	}
-	db.size.Store(validSize)
+	db.size.Store(size)
 	return nil
 }
 
@@ -155,7 +145,6 @@ func (db *DB) apply(rec record) {
 		}
 		c[rec.ID] = rec.Doc
 		db.dirty[rec.Coll] = true
-		delete(db.dropped, rec.Coll)
 	case opDel:
 		c := db.colls[rec.Coll]
 		if _, ok := c[rec.ID]; !ok {
@@ -168,7 +157,6 @@ func (db *DB) apply(rec record) {
 			return
 		}
 		delete(db.colls, rec.Coll)
-		delete(db.dirty, rec.Coll)
-		db.dropped[rec.Coll] = true
+		db.dirty[rec.Coll] = true
 	}
 }

@@ -17,15 +17,22 @@ func (db *DB) writeSnapshot(err error) error {
 		return err
 	}
 	db.mu.Lock()
-	if len(db.dirty) == 0 && len(db.dropped) == 0 && db.size.Load() == 0 {
+	if len(db.dirty) == 0 && db.size.Load() == 0 {
 		db.mu.Unlock()
 		return nil
 	}
-	dirty, dropped := db.dirty, db.dropped
-	db.dirty, db.dropped = map[string]bool{}, map[string]bool{}
+	dirty := db.dirty
+	db.dirty = map[string]bool{}
+	// A dirty name that no longer has a collection was dropped.
 	snaps := make(map[string][]byte, len(dirty))
+	var dropped []string
 	for name := range dirty {
-		b, err := json.Marshal(db.colls[name])
+		coll, ok := db.colls[name]
+		if !ok {
+			dropped = append(dropped, name)
+			continue
+		}
+		b, err := json.Marshal(coll)
 		if err != nil {
 			db.mu.Unlock()
 			return err
@@ -43,7 +50,7 @@ func (db *DB) writeSnapshot(err error) error {
 			return err
 		}
 	}
-	for name := range dropped {
+	for _, name := range dropped {
 		if err := db.removeColl(name); err != nil {
 			return err
 		}

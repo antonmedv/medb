@@ -101,11 +101,10 @@ type DB struct {
 	dir   string
 	opts  options
 
-	mu      sync.RWMutex
-	colls   map[string]map[string]json.RawMessage
-	dirty   map[string]bool
-	dropped map[string]bool
-	closed  bool
+	mu     sync.RWMutex
+	colls  map[string]map[string]json.RawMessage
+	dirty  map[string]bool
+	closed bool
 
 	logMu   sync.Mutex
 	log     file
@@ -164,15 +163,14 @@ func Open(dir string, opts ...Option) (*DB, error) {
 		}
 	}()
 	db := &DB{
-		flock:   flock,
-		dir:     dir,
-		opts:    o,
-		colls:   map[string]map[string]json.RawMessage{},
-		dirty:   map[string]bool{},
-		dropped: map[string]bool{},
-		log:     log,
-		notify:  make(chan struct{}, 1),
-		stop:    make(chan struct{}),
+		flock:  flock,
+		dir:    dir,
+		opts:   o,
+		colls:  map[string]map[string]json.RawMessage{},
+		dirty:  map[string]bool{},
+		log:    log,
+		notify: make(chan struct{}, 1),
+		stop:   make(chan struct{}),
 	}
 	if err := db.load(); err != nil {
 		return nil, err
@@ -214,7 +212,6 @@ func (db *DB) Close() error {
 
 	clear(db.colls)
 	clear(db.dirty)
-	clear(db.dropped)
 	return err
 }
 

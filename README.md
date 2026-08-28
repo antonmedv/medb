@@ -4,11 +4,12 @@
 
 ## Features
 
-- In-memory DB with persistence on disk.
-- WAL and full durability of writes.
-- Optional [MeDB server](cmd/medb/README.md)
-  - Simple HTTP API 
-  - Roles and token authentication.
+- In-memory database with on-disk persistence.
+- Simple file layout, such as `prod/users.json`.
+- Write-ahead log (WAL) with durable writes.
+- Optional [MeDB server](cmd/medb/README.md):
+    - Simple HTTP API.
+    - Token-based authentication and roles.
 
 ## Rationale
 

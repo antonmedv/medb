@@ -20,8 +20,6 @@ memory, stored as JSON on disk, without losing records if the process crashes.
 
 ## Usage
 
-## Usage
-
 Install MeDB:
 
 ```sh
